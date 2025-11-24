@@ -156,6 +156,13 @@ if(OFT_PACKAGE_BUILD)
 else()
   set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 endif()
+
+# ====== start modified by yfzhao ======
+# Explicitly disable executable stack for security and compatibility
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -z noexecstack")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -z noexecstack")
+# ====== end modified by yfzhao ========
+
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 
 ########################

@@ -15,3 +15,20 @@
 .project
 .pydevproject
 .vscode
+
+# AI
+CLAUDE.md
+IFLOW.md
+
+# libs
+/OpenBLAS-0_3_30*
+/fox-4_1_2*
+/hdf5-1_14_6*
+/metis-5_1_0*
+
+# cmake
+config_cmake.sh
+
+src/doxy_warnings.log
+reference
+/examples/*

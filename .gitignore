@@ -25,10 +25,11 @@ OpenBLAS*
 fox*
 hdf5*
 metis*
+arpack*
 
 # cmake
 config_cmake.sh
 
 src/doxy_warnings.log
-# reference
+reference
 examples/*

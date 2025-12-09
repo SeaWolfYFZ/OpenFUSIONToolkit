@@ -31,6 +31,17 @@ USE mhd_utils, ONLY: mu0
 USE thin_wall
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op, oft_tw_hodlr_bjpre, oft_tw_hodlr_rbjpre
 IMPLICIT NONE
+
+abstract interface
+    function curr_callback_interface(t, n_curr, curr, dcurr) result(status)
+        implicit none
+        real(8), intent(in) :: t
+        integer(4), intent(in) :: n_curr
+        real(8), intent(out) :: curr(n_curr), dcurr(n_curr)
+        integer(4) :: status
+    end function curr_callback_interface
+end interface
+
 #include "local.h"
 CONTAINS
 !---------------------------------------------------------------------------------
@@ -610,7 +621,7 @@ END SUBROUTINE frequency_response
 !---------------------------------------------------------------------------------
 !> Needs Docs
 !---------------------------------------------------------------------------------
-SUBROUTINE run_td_sim_2(self,dt,nsteps,vec,direct,lin_tol,use_cn,nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_vals,hodlr_op)
+SUBROUTINE run_td_sim_callback(self,dt,nsteps,vec,direct,lin_tol,use_cn,nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_vals,curr_callback,hodlr_op)
 TYPE(tw_type), INTENT(in) :: self
 REAL(8), INTENT(in) :: dt
 INTEGER(4), INTENT(in) :: nsteps
@@ -624,6 +635,7 @@ TYPE(tw_sensors), INTENT(in) :: sensors
 REAL(8), POINTER, INTENT(in) :: curr_waveform(:,:)
 REAL(8), POINTER, INTENT(in) :: volt_waveform(:,:)
 REAL(8), POINTER, INTENT(in) :: sensor_vals(:,:)
+PROCEDURE(curr_callback_interface) :: curr_callback
 TYPE(oft_tw_hodlr_op), TARGET, OPTIONAL, INTENT(inout) :: hodlr_op !< HODLR L matrix
 !---
 INTEGER(4) :: i,j,k,ntimes_curr,ntimes_volt,ncols,itime,io_unit,neta,face,info,ind1,nits,int_inds(2)
@@ -642,6 +654,7 @@ LOGICAL :: exists,volt_full
 CHARACTER(LEN=4) :: pltnum
 CHARACTER(LEN=15) :: fmt_str
 CHARACTER(LEN=OFT_SLEN) :: hole_jumper_name
+INTEGER(4) :: callback_status
 WRITE(*,*)
 WRITE(*,*)'Starting simulation'
 !---Setup coil waveform
@@ -888,6 +901,16 @@ DO i=1,nsteps
       pcoil_volt=pcoil_volt*dt
     END IF
   END IF
+
+  ! icoil_curr(1) = sin(2.0E3*3.1415927d0*t + 0.333*3.1415927d0) * 2.0E3
+  ! icoil_dcurr(1) = 2.0E3*3.14159265358979323846d0 * cos(2.0E3*3.1415927d0*t + 0.333*3.1415927d0) * 2.0E3
+
+  callback_status=curr_callback(t,self%n_icoils,icoil_curr,icoil_dcurr)
+  ! IF(callback_status/=0)THEN
+  !   WRITE(*,*)'Callback error: ',callback_status
+  !   STOP
+  ! END IF
+  
   uu=g%dot(g)
   CALL g%get_local(vals)
   IF(ntimes_curr>0)CALL dgemv('N',self%nelems,self%n_icoils,-1.d0,self%Ael2dr, &
@@ -913,6 +936,11 @@ DO i=1,nsteps
   uu=SQRT(u%dot(u))
   t=t+dt
   IF(MOD(i,nstatus)==0)WRITE(*,*)'Timestep ',i,REAL(t,4),REAL(uu,4),nits
+  IF(MOD(i,nstatus)==0)THEN
+    DO j=1,self%n_icoils
+      write(*,*)'Coil ',j,' icoil_curr ',REAL(icoil_curr(j),4),' icoil_dcurr ',REAL(icoil_dcurr(j),4)
+    END DO
+  END IF
   IF(MOD(i,nplot)==0)THEN
     WRITE(pltnum,'(I4.4)')i
     CALL tw_rst_save(self,u,'pThinCurr_'//pltnum//'.rst','U')
@@ -992,7 +1020,7 @@ ELSE
   CALL linv%delete()
   DEALLOCATE(linv)
 END IF
-END SUBROUTINE run_td_sim_2
+END SUBROUTINE run_td_sim_callback
 
 !---------------------------------------------------------------------------------
 !> Needs Docs

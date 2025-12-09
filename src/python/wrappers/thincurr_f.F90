@@ -9,7 +9,7 @@
 !------------------------------------------------------------------------------
 MODULE thincurr_f
 USE iso_c_binding, ONLY: c_int, c_double, c_char, c_loc, c_null_char, c_ptr, &
-    c_f_pointer, c_bool, c_null_ptr, c_associated
+    c_f_pointer, c_f_procpointer, c_bool, c_null_ptr, c_associated, c_funptr
 !---Base
 USE oft_base
 USE spline_mod
@@ -27,17 +27,49 @@ USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_
   tw_recon_curr, tw_compute_Bops
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
-  tw_reduce_model, run_td_sim, run_td_sim_2, plot_td_sim
+  tw_reduce_model, run_td_sim, run_td_sim_callback, plot_td_sim
 USE mhd_utils, ONLY: mu0
 !---Wrappers
 USE oft_base_f, ONLY: copy_string, copy_string_rev
 IMPLICIT NONE
 #include "local.h"
+
+abstract interface
+  function curr_callback_interface_c(t_c, n_curr_c, curr_c, dcurr_c) bind(c)
+    import c_double, c_int
+    real(c_double), intent(in) :: t_c
+    integer(c_int), intent(in) :: n_curr_c
+    real(c_double), intent(inout) :: curr_c(n_curr_c)
+    real(c_double), intent(inout) :: dcurr_c(n_curr_c)
+    integer(c_int) :: curr_callback_interface_c
+  end function curr_callback_interface_c
+end interface
+
+procedure(curr_callback_interface_c), pointer, save :: curr_callback_ptr_c => NULL()
 !
 integer(i4), POINTER :: lc_plot(:,:) !< Needs docs
 integer(i4), POINTER :: reg_plot(:) !< Needs docs
 real(r8), POINTER :: r_plot(:,:) !< Needs docs
 CONTAINS
+!---------------------------------------------------------------------------------
+!> current callback wrapper
+!---------------------------------------------------------------------------------
+function curr_callback_wrapper(t_f, n_curr_f, curr_f, dcurr_f) result(status_f)
+  real(8), intent(in) :: t_f
+  integer(4), intent(in) :: n_curr_f
+  real(8), intent(out) :: curr_f(n_curr_f)
+  real(8), intent(out) :: dcurr_f(n_curr_f)
+  integer(4) :: status_f
+
+  if(.not. associated(curr_callback_ptr_c)) then
+    write(*,*) '[thincurr_f.F90]','<curr_callback_wrapper>','curr_callback_ptr is not associated'
+    status_f = -1
+    return
+  end if
+
+  status_f = curr_callback_ptr_c(t_f,n_curr_f,curr_f,dcurr_f)
+  
+end function curr_callback_wrapper
 !---------------------------------------------------------------------------------
 !> Needs docs
 !---------------------------------------------------------------------------------
@@ -870,8 +902,8 @@ END SUBROUTINE thincurr_freq_response
 !---------------------------------------------------------------------------------
 !> Needs docs
 !---------------------------------------------------------------------------------
-SUBROUTINE thincurr_time_domain_2(tw_ptr,direct,dt,nsteps,cg_tol,timestep_cn,nstatus,nplot, &
-  vec_ic,sensor_ptr,ncurr,curr_ptr,nvolt,volt_ptr,volts_full,sensor_vals_ptr,hodlr_ptr,error_str) BIND(C,NAME="thincurr_time_domain_2")
+SUBROUTINE thincurr_time_domain_callback(tw_ptr,direct,dt,nsteps,cg_tol,timestep_cn,nstatus,nplot, &
+  vec_ic,sensor_ptr,ncurr,curr_ptr,nvolt,volt_ptr,volts_full,sensor_vals_ptr,curr_callback_c,hodlr_ptr,error_str) BIND(C,NAME="thincurr_time_domain_callback")
 TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr !< Needs docs
 LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: direct !< Needs docs
 REAL(KIND=c_double), VALUE, INTENT(in) :: dt !< Needs docs
@@ -888,6 +920,7 @@ INTEGER(KIND=c_int), VALUE, INTENT(in) :: nvolt !< Needs docs
 TYPE(c_ptr), VALUE, INTENT(in) :: volt_ptr !< Needs docs
 LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: volts_full !< Needs docs
 TYPE(c_ptr), VALUE, INTENT(in) :: sensor_vals_ptr !< Needs docs
+type(c_funptr), value :: curr_callback_c
 TYPE(c_ptr), VALUE, INTENT(in) :: hodlr_ptr !< Needs docs
 CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN) !< Needs docs
 !
@@ -896,6 +929,15 @@ REAL(8), CONTIGUOUS, POINTER :: ic_tmp(:),curr_waveform(:,:),volt_waveform(:,:),
 TYPE(tw_type), POINTER :: tw_obj
 TYPE(tw_sensors), POINTER :: sensors
 TYPE(oft_tw_hodlr_op), POINTER :: hodlr_op
+procedure(curr_callback_interface_c), pointer :: curr_callback_f
+call c_f_procpointer(curr_callback_c, curr_callback_f)
+if(.not. associated(curr_callback_f)) then
+  write(*,*) '[thincurr_f.F90]','<thincurr_time_domain_callback>','curr_callback_f is not associated'
+  CALL copy_string('curr_callback_f is not associated',error_str)
+  RETURN
+end if
+curr_callback_ptr_c => curr_callback_f
+
 CALL c_f_pointer(tw_ptr, tw_obj)
 IF(tw_obj%nelems<=0)THEN
   CALL copy_string('Invalid ThinCurr model, may not be setup yet',error_str)
@@ -951,14 +993,14 @@ CALL c_f_pointer(vec_ic, ic_tmp, [tw_obj%nelems])
 pm_save=oft_env%pm; oft_env%pm=.FALSE.
 IF(c_associated(hodlr_ptr))THEN
   CALL c_f_pointer(hodlr_ptr, hodlr_op)
-  CALL run_td_sim_2(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),cg_tol,LOGICAL(timestep_cn), &
-    nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform,hodlr_op=hodlr_op)
+  CALL run_td_sim_callback(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),cg_tol,LOGICAL(timestep_cn), &
+    nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform,curr_callback_wrapper,hodlr_op=hodlr_op)
 ELSE
-  CALL run_td_sim_2(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),cg_tol,LOGICAL(timestep_cn), &
-    nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform)
+  CALL run_td_sim_callback(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),cg_tol,LOGICAL(timestep_cn), &
+    nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform,curr_callback_wrapper)
 END IF
 oft_env%pm=pm_save
-END SUBROUTINE thincurr_time_domain_2
+END SUBROUTINE thincurr_time_domain_callback
 !---------------------------------------------------------------------------------
 !> Needs docs
 !---------------------------------------------------------------------------------

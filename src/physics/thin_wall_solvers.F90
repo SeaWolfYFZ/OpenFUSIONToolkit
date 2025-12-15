@@ -906,10 +906,10 @@ DO i=1,nsteps
   ! icoil_dcurr(1) = 2.0E3*3.14159265358979323846d0 * cos(2.0E3*3.1415927d0*t + 0.333*3.1415927d0) * 2.0E3
 
   callback_status=curr_callback(t,self%n_icoils,icoil_curr,icoil_dcurr)
-  ! IF(callback_status/=0)THEN
-  !   WRITE(*,*)'Callback error: ',callback_status
-  !   STOP
-  ! END IF
+  IF(callback_status/=0)THEN
+    WRITE(*,*)'Callback error: ',callback_status
+    STOP
+  END IF
   
   uu=g%dot(g)
   CALL g%get_local(vals)
@@ -936,11 +936,11 @@ DO i=1,nsteps
   uu=SQRT(u%dot(u))
   t=t+dt
   IF(MOD(i,nstatus)==0)WRITE(*,*)'Timestep ',i,REAL(t,4),REAL(uu,4),nits
-  IF(MOD(i,nstatus)==0)THEN
-    DO j=1,self%n_icoils
-      write(*,*)'Coil ',j,' icoil_curr ',REAL(icoil_curr(j),4),' icoil_dcurr ',REAL(icoil_dcurr(j),4)
-    END DO
-  END IF
+  ! IF(MOD(i,nstatus)==0)THEN
+  !   DO j=1,self%n_icoils
+  !     write(*,*)'Coil ',j,' icoil_curr ',REAL(icoil_curr(j),4),' icoil_dcurr ',REAL(icoil_dcurr(j),4)
+  !   END DO
+  ! END IF
   IF(MOD(i,nplot)==0)THEN
     WRITE(pltnum,'(I4.4)')i
     CALL tw_rst_save(self,u,'pThinCurr_'//pltnum//'.rst','U')

@@ -25,6 +25,7 @@ OpenBLAS-0_3_30*
 fox-4_1_2*
 hdf5-1_14_6*
 metis-5_1_0*
+arpack-ng-3_9_1/
 
 # cmake
 config_cmake.sh

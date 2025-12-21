@@ -35,6 +35,6 @@ reference
 examples/*
 
 app/**/build*
-app/**/oftcppin
+# app/**/oftcppin
 app/**/*.h5
 app/**/*.xml

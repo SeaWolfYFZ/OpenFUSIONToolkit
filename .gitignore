@@ -33,3 +33,8 @@ config_cmake.sh
 src/doxy_warnings.log
 reference
 examples/*
+
+app/**/build*
+app/**/oftcppin
+app/**/*.h5
+app/**/*.xml

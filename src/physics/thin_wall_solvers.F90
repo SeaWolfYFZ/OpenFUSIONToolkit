@@ -1702,23 +1702,7 @@ state%step_count = state%step_count + 1
 CALL state%up%add(0.d0,1.d0,state%u)
 !---Update driven coil dI/dt waveforms
 IF(state%use_cn)THEN
-  ! WRITE(*,*) 'DEBUG: state%use_cn is TRUE'
-  ! IF(.NOT.ASSOCIATED(state%bmat)) WRITE(*,*) 'DEBUG: state%bmat is NULL'
-  ! IF(ASSOCIATED(state%bmat)) THEN
-  !    IF(.NOT.ASSOCIATED(state%bmat%J)) WRITE(*,*) 'DEBUG: state%bmat%J is NULL'
-  !    IF(.NOT.ASSOCIATED(state%bmat%K)) WRITE(*,*) 'DEBUG: state%bmat%K is NULL'
-  ! END IF
-  ! IF(.NOT.ASSOCIATED(state%g)) WRITE(*,*) 'DEBUG: state%g is NULL'
-  ! WRITE(*,*) 'DEBUG: Testing Lmat apply'
-  CALL state%Lmat%apply(state%u, state%g)
-  ! WRITE(*,*) 'DEBUG: Testing Rmat apply'
-  CALL state%tw%Rmat%apply(state%u, state%g)
-  ! WRITE(*,*) 'DEBUG: Manual apply finished'
-  ! CALL state%bmat%apply(state%u,state%g)
-  ! WRITE(*,*) 'DEBUG: Checking icoil_dcurr'
-  ! IF(ALLOCATED(state%icoil_dcurr)) WRITE(*,*) 'DEBUG: state%icoil_dcurr is allocated, size=', SIZE(state%icoil_dcurr)
-  ! WRITE(*,*) 'DEBUG: state%ntimes_curr =', state%ntimes_curr
-  ! IF(ASSOCIATED(state%curr_waveform)) WRITE(*,*) 'DEBUG: state%curr_waveform is associated'
+  CALL state%bmat%apply(state%u,state%g)
   IF(PRESENT(icoil_dcurr_in))THEN
     state%icoil_dcurr = icoil_dcurr_in
   ELSEIF(state%ntimes_curr>0)THEN

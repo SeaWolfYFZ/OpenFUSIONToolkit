@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # OFT库配置
-set(OFT_INSTALL_DIR "/home/yfz/project/OpenFUSIONToolkit-251222/install_release")
+set(OFT_INSTALL_DIR "/home/yfz/project/OpenFUSIONToolkit-251219-glm4.7/install_release")
 set(OFT_LIB "${OFT_INSTALL_DIR}/bin/liboftpy.so")
 
 # 检查OFT库是否存在

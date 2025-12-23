@@ -125,6 +125,12 @@ int main(int argc, char* argv[]) {
         if (i == 0) log_info("Starting time step 0...");
         double t = i * dt;
 
+        double freq = 1.0E3/16.0;
+        double I1_amplitude = 1.0E6;
+        double I2_amplitude = 0.5E6;
+
+        double omega = 2.0 * M_PI * freq;
+
         // Interpolate coil currents at this time step
         for (int32_t j = 0; j < n_icoils; j++) {
             icoil_curr[j] = linterp(coil_currs_transposed,
@@ -132,34 +138,39 @@ int main(int argc, char* argv[]) {
                                     n_time_points, t);
         }
 
-        // Compute dI/dt for Crank-Nicolson (using 4-point stencil as in original code)
-        if (i == 0) {
-            // First step: use forward difference
-            double t_next = (i + 1) * dt;
-            for (int32_t j = 0; j < n_icoils; j++) {
-                double curr_next = linterp(coil_currs_transposed,
-                                          &coil_currs_transposed[(j + 1) * n_time_points],
-                                          n_time_points, t_next);
-                icoil_dcurr[j] = (curr_next - icoil_curr[j]) / dt;
-            }
-        } else {
-            // Crank-Nicolson: average of derivatives at start and end of step
-            for (int32_t j = 0; j < n_icoils; j++) {
-                double d1 = linterp(coil_currs_transposed,
-                                   &coil_currs_transposed[(j + 1) * n_time_points],
-                                   n_time_points, t + dt/4.0);
-                double d2 = linterp(coil_currs_transposed,
-                                   &coil_currs_transposed[(j + 1) * n_time_points],
-                                   n_time_points, t - dt/4.0);
-                double d3 = linterp(coil_currs_transposed,
-                                   &coil_currs_transposed[(j + 1) * n_time_points],
-                                   n_time_points, t + dt*5.0/4.0);
-                double d4 = linterp(coil_currs_transposed,
-                                   &coil_currs_transposed[(j + 1) * n_time_points],
-                                   n_time_points, t + dt*3.0/4.0);
-                icoil_dcurr[j] = (d1 - d2) + (d3 - d4);
-            }
-        }
+        // // Compute dI/dt for Crank-Nicolson (using 4-point stencil as in original code)
+        // if (i == 0) {
+        //     // First step: use forward difference
+        //     double t_next = (i + 1) * dt;
+        //     for (int32_t j = 0; j < n_icoils; j++) {
+        //         double curr_next = linterp(coil_currs_transposed,
+        //                                   &coil_currs_transposed[(j + 1) * n_time_points],
+        //                                   n_time_points, t_next);
+        //         icoil_dcurr[j] = (curr_next - icoil_curr[j]) / dt;
+        //     }
+        // } else {
+        //     // Crank-Nicolson: average of derivatives at start and end of step
+        //     for (int32_t j = 0; j < n_icoils; j++) {
+        //         double d1 = linterp(coil_currs_transposed,
+        //                            &coil_currs_transposed[(j + 1) * n_time_points],
+        //                            n_time_points, t + dt/4.0);
+        //         double d2 = linterp(coil_currs_transposed,
+        //                            &coil_currs_transposed[(j + 1) * n_time_points],
+        //                            n_time_points, t - dt/4.0);
+        //         double d3 = linterp(coil_currs_transposed,
+        //                            &coil_currs_transposed[(j + 1) * n_time_points],
+        //                            n_time_points, t + dt*5.0/4.0);
+        //         double d4 = linterp(coil_currs_transposed,
+        //                            &coil_currs_transposed[(j + 1) * n_time_points],
+        //                            n_time_points, t + dt*3.0/4.0);
+        //         icoil_dcurr[j] = (d1 - d2) + (d3 - d4);
+        //     }
+        // }
+
+        icoil_curr[0]   = I1_amplitude * sin(omega * t);
+        icoil_dcurr[0]  = omega * I1_amplitude * cos(omega * t) * dt;
+        icoil_curr[1]   = I2_amplitude;
+        icoil_dcurr[1]  = 0.0;
 
         // Advance one time step
         bool save_plot = ((i + 1) % 10 == 0);

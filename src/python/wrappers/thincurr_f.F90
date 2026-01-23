@@ -24,7 +24,7 @@ USE oft_la_base, ONLY: oft_vector
 USE fem_utils, ONLY: fem_interp
 USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_Rmat, &
   tw_compute_Ael2dr, tw_sensors, tw_compute_mutuals, tw_load_sensors, tw_compute_Lmat_MF, &
-  tw_recon_curr, tw_compute_Bops
+  tw_recon_curr, tw_compute_Bops, tw_eval_B_at_points
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
   tw_reduce_model, run_td_sim, plot_td_sim, run_td_sim_init, run_td_sim_step, run_td_sim_finalize, &
@@ -428,6 +428,72 @@ IF(tw_obj%n_icoils>0)THEN
 END IF
 DEBUG_STACK_POP
 END SUBROUTINE thincurr_recon_field
+!---------------------------------------------------------------------------------
+!> Needs docs
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_eval_field_points(tw_ptr,pot,coils,npts,pts,field,error_str) &
+  BIND(C,NAME="thincurr_eval_field_points")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr !< Needs docs
+TYPE(c_ptr), VALUE, INTENT(in) :: pot !< Needs docs
+TYPE(c_ptr), VALUE, INTENT(in) :: coils !< Needs docs
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: npts !< Number of points
+TYPE(c_ptr), VALUE, INTENT(in) :: pts !< Points [3,npts]
+TYPE(c_ptr), VALUE, INTENT(in) :: field !< Field [3,npts]
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN) !< Needs docs
+REAL(8), POINTER, DIMENSION(:) :: pot_tmp
+REAL(8), POINTER, DIMENSION(:) :: coils_tmp
+REAL(8), POINTER, DIMENSION(:,:) :: pts_tmp, field_tmp
+REAL(8), ALLOCATABLE, TARGET :: coils_dummy(:)
+TYPE(tw_type), POINTER :: tw_obj
+CALL copy_string('',error_str)
+CALL c_f_pointer(tw_ptr, tw_obj)
+IF(npts<0)THEN
+  CALL copy_string('npts must be >= 0',error_str)
+  RETURN
+END IF
+CALL c_f_pointer(pot, pot_tmp, [tw_obj%nelems])
+CALL c_f_pointer(pts, pts_tmp, [3,npts])
+CALL c_f_pointer(field, field_tmp, [3,npts])
+IF(tw_obj%n_icoils>0)THEN
+  CALL c_f_pointer(coils, coils_tmp, [tw_obj%n_icoils])
+ELSE
+  ALLOCATE(coils_dummy(1))
+  coils_dummy=0.d0
+  coils_tmp=>coils_dummy
+END IF
+CALL tw_eval_B_at_points(tw_obj,pts_tmp,pot_tmp,coils_tmp,field_tmp)
+IF(ALLOCATED(coils_dummy))DEALLOCATE(coils_dummy)
+END SUBROUTINE thincurr_eval_field_points
+!---------------------------------------------------------------------------------
+!> Needs docs
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_eval_field_points(td_state_ptr,npts,pts,field,error_str) &
+  BIND(C,NAME="thincurr_td_eval_field_points")
+TYPE(c_ptr), VALUE, INTENT(in) :: td_state_ptr !< Needs docs
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: npts !< Number of points
+TYPE(c_ptr), VALUE, INTENT(in) :: pts !< Points [3,npts]
+TYPE(c_ptr), VALUE, INTENT(in) :: field !< Field [3,npts]
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN) !< Needs docs
+REAL(8), POINTER, DIMENSION(:) :: u_tmp
+REAL(8), POINTER, DIMENSION(:,:) :: pts_tmp, field_tmp
+TYPE(tw_td_state), POINTER :: state
+CALL copy_string('',error_str)
+CALL c_f_pointer(td_state_ptr, state)
+IF(.NOT.state%initialized)THEN
+  CALL copy_string('TD state not initialized',error_str)
+  RETURN
+END IF
+IF(npts<0)THEN
+  CALL copy_string('npts must be >= 0',error_str)
+  RETURN
+END IF
+CALL c_f_pointer(pts, pts_tmp, [3,npts])
+CALL c_f_pointer(field, field_tmp, [3,npts])
+NULLIFY(u_tmp)
+CALL state%u%get_local(u_tmp)
+CALL tw_eval_B_at_points(state%tw_obj,pts_tmp,u_tmp,state%icoil_curr,field_tmp)
+DEALLOCATE(u_tmp)
+END SUBROUTINE thincurr_td_eval_field_points
 !---------------------------------------------------------------------------------
 !> Needs docs
 !---------------------------------------------------------------------------------

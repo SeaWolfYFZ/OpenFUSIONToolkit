@@ -2180,6 +2180,167 @@ END IF
 END SUBROUTINE save_to_file
 END SUBROUTINE tw_compute_Bops
 !---------------------------------------------------------------------------------
+!> Compute magnetic field at arbitrary probe points
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_eval_B_at_points(self,pts,u,coil_curr,Bout)
+CLASS(tw_type), INTENT(in) :: self
+REAL(r8), INTENT(in) :: pts(:,:) !< Probe points [3,npts]
+REAL(r8), INTENT(in) :: u(:) !< Thin-wall solution vector [nelems]
+REAL(r8), INTENT(in) :: coil_curr(:) !< I-coil currents [n_icoils]
+REAL(r8), INTENT(out) :: Bout(:,:) !< Magnetic field at points [3,npts]
+REAL(r8) :: evec_i(3,3),pts_i(3,3),pt_i(3),pt_j(3),diffvec(3),ecc(3)
+REAL(r8) :: tmp,area_i,dl_min,dl_max,norm_j(3),f(3),cvec(3),cpt(3)
+REAL(r8), ALLOCATABLE :: atmp(:,:,:)
+REAL(8), PARAMETER :: B_dx = 1.d-6
+INTEGER(4) :: i,ii,j,jj,ik,k,kk,iquad,npts
+LOGICAL :: is_neighbor
+CLASS(oft_bmesh), POINTER :: bmesh
+TYPE(oft_quad_type), ALLOCATABLE :: quads(:)
+IF(SIZE(pts,1)/=3)CALL oft_abort('pts must be [3,npts]','tw_eval_B_at_points',__FILE__)
+npts=SIZE(pts,2)
+IF(SIZE(Bout,1)/=3 .OR. SIZE(Bout,2)/=npts)CALL oft_abort('Bout size mismatch','tw_eval_B_at_points',__FILE__)
+Bout=0.d0
+IF(npts==0)RETURN
+bmesh=>self%mesh
+ALLOCATE(quads(18))
+DO i=1,18
+  CALL set_quad_2d(quads(i),i)
+END DO
+ALLOCATE(atmp(3,3,npts))
+f=1.d0/3.d0
+!$omp parallel private(ii,j,jj,ik,pts_i,tmp,pt_i,pt_j,evec_i, &
+!$omp atmp,i,area_i,dl_min,dl_max,norm_j,diffvec,is_neighbor,iquad)
+!$omp do schedule(dynamic,100)
+DO i=1,bmesh%nc
+  area_i=bmesh%ca(i)
+  DO ii=1,3
+    pts_i(:,ii)=bmesh%r(:,bmesh%lc(ii,i))
+    evec_i(:,ii)=self%qbasis(:,ii,i)
+  END DO
+  CALL bmesh%norm(i,f,norm_j)
+  atmp=0.d0
+  DO j=1,npts
+    pt_j=pts(:,j)
+    dl_min=1.d99
+    dl_max=SQRT(MAX(area_i,1.d-30))
+    DO ii=1,3
+      tmp=SQRT(SUM((pts_i(:,ii)-pt_j)**2))
+      dl_min=MIN(dl_min,tmp)
+      dl_max=MAX(dl_max,tmp)
+    END DO
+    IF(dl_min<1.d-8)THEN
+      iquad = 18
+      is_neighbor=.TRUE.
+    ELSE
+      IF(dl_min>=0.999999d0*dl_max)THEN
+        iquad=4
+      ELSE
+        iquad = MAX(4,MIN(18,ABS(INT(LOG(target_err)/LOG(1.d0-dl_min/dl_max)))))
+      END IF
+      is_neighbor=.FALSE.
+    END IF
+    IF(iquad>10)THEN
+      IF(is_neighbor)THEN
+        pt_j = pt_j - norm_j*10.d0*B_dx
+      END IF
+      diffvec=0.d0
+      DO ik=1,2
+        IF(ik==2)pt_j=pt_j+norm_j*20.d0*B_dx
+        DO jj=1,3
+          pt_j(jj)=pt_j(jj)+B_dx
+          tmp=tw_compute_phipot(pts_i,pt_j)
+          diffvec(jj)=diffvec(jj)+tmp/(2.d0*B_dx)
+          pt_j(jj)=pt_j(jj)-2.d0*B_dx
+          tmp=tw_compute_phipot(pts_i,pt_j)
+          diffvec(jj)=diffvec(jj)-tmp/(2.d0*B_dx)
+          pt_j(jj)=pt_j(jj)+B_dx
+        END DO
+        IF(.NOT.is_neighbor)EXIT
+      END DO
+      IF(is_neighbor)diffvec=diffvec/2.d0
+      DO ik=1,3
+        atmp(1,ik,j) = diffvec(2)*evec_i(3,ik) - diffvec(3)*evec_i(2,ik)
+        atmp(2,ik,j) = diffvec(3)*evec_i(1,ik) - diffvec(1)*evec_i(3,ik)
+        atmp(3,ik,j) = diffvec(1)*evec_i(2,ik) - diffvec(2)*evec_i(1,ik)
+      END DO
+    ELSE
+      DO ik=1,3
+        diffvec=0.d0
+        DO ii=1,quads(iquad)%np
+          pt_i = pt_j - (quads(iquad)%pts(1,ii)*pts_i(:,1) &
+            + quads(iquad)%pts(2,ii)*pts_i(:,2) &
+            + quads(iquad)%pts(3,ii)*pts_i(:,3))
+          diffvec = diffvec + cross_product(evec_i(:,ik),pt_i)*quads(iquad)%wts(ii)/(SUM(pt_i**2))**1.5d0
+        END DO
+        atmp(:,ik,j) = diffvec*area_i
+      END DO
+    END IF
+  END DO
+  DO ii=1,3
+    ik=self%pmap(bmesh%lc(ii,i))
+    IF(ik==0)CYCLE
+    DO j=1,npts
+      Bout(:,j) = Bout(:,j) + u(ik)*atmp(:,ii,j)
+    END DO
+  END DO
+  DO ii=self%kfh(i),self%kfh(i+1)-1
+    ik=ABS(self%lfh(1,ii))+self%np_active
+    DO j=1,npts
+      tmp=SIGN(1,self%lfh(1,ii))
+      Bout(:,j) = Bout(:,j) + u(ik)*tmp*atmp(:,self%lfh(2,ii),j)
+    END DO
+  END DO
+END DO
+!$omp end do
+!$omp end parallel
+DEALLOCATE(atmp)
+DO i=1,18
+  CALL quads(i)%delete()
+END DO
+DEALLOCATE(quads)
+! Add vcoil contributions (scaled with 1/(4*pi))
+IF(self%n_vcoils>0)THEN
+  DO j=1,npts
+    pt_j=pts(:,j)
+    DO k=1,self%n_vcoils
+      ecc = 0.d0
+      IF(self%vcoils(k)%sens_mask)CYCLE
+      DO kk=1,self%vcoils(k)%ncoils
+        diffvec=0.d0
+        DO ii=2,self%vcoils(k)%coils(kk)%npts
+          cvec = self%vcoils(k)%coils(kk)%pts(:,ii)-self%vcoils(k)%coils(kk)%pts(:,ii-1)
+          cpt = (self%vcoils(k)%coils(kk)%pts(:,ii)+self%vcoils(k)%coils(kk)%pts(:,ii-1))/2.d0
+          diffvec = diffvec + cross_product(cvec,pt_j-cpt)/SUM((pt_j-cpt)**2)**1.5d0
+        END DO
+        ecc=ecc+self%vcoils(k)%scales(kk)*diffvec
+      END DO
+      Bout(:,j) = Bout(:,j) + u(self%np_active+self%nholes+k)*ecc
+    END DO
+  END DO
+END IF
+Bout = Bout/(4.d0*pi)
+! Add icoil contributions (scaled with mu0/(4*pi))
+IF(self%n_icoils>0)THEN
+  DO j=1,npts
+    pt_j=pts(:,j)
+    DO k=1,self%n_icoils
+      ecc = 0.d0
+      IF(self%icoils(k)%sens_mask)CYCLE
+      DO kk=1,self%icoils(k)%ncoils
+        diffvec=0.d0
+        DO ii=2,self%icoils(k)%coils(kk)%npts
+          cvec = self%icoils(k)%coils(kk)%pts(:,ii)-self%icoils(k)%coils(kk)%pts(:,ii-1)
+          cpt = (self%icoils(k)%coils(kk)%pts(:,ii)+self%icoils(k)%coils(kk)%pts(:,ii-1))/2.d0
+          diffvec = diffvec + cross_product(cvec,pt_j-cpt)/SUM((pt_j-cpt)**2)**1.5d0
+        END DO
+        ecc=ecc+self%icoils(k)%scales(kk)*diffvec
+      END DO
+      Bout(:,j) = Bout(:,j) + coil_curr(k)*ecc*mu0/(4.d0*pi)
+    END DO
+  END DO
+END IF
+END SUBROUTINE tw_eval_B_at_points
+!---------------------------------------------------------------------------------
 !> Setup hole definition for ordered chain of vertices
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_setup_hole(bmesh,hmesh)

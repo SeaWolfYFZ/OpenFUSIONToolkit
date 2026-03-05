@@ -99,6 +99,11 @@ ELSE
   !------------------------------------------------------------------------------
   ! Load model from file
   !------------------------------------------------------------------------------
+  INQUIRE(FILE=TRIM(filename),EXIST=success)
+  IF(.NOT.success)THEN
+    CALL copy_string('Mesh file does not exist or is not accesible',error_str)
+    RETURN
+  END IF
   ALLOCATE(tw_obj)
   ALLOCATE(oft_trimesh::tw_obj%mesh)
   CALL tw_obj%mesh%setup(-1,.FALSE.)
@@ -151,6 +156,8 @@ ELSE
   ELSE
     tw_obj%mesh%reg=1
   END IF
+  i=MAXVAL(tw_obj%mesh%reg)
+  tw_obj%mesh%nreg=oft_mpi_max(i)
   !
   IF(hdf5_field_exist(TRIM(filename),'thincurr/periodicity/pmap'))THEN
     ALLOCATE(tw_obj%pmap(tw_obj%mesh%np))
@@ -937,13 +944,14 @@ END SUBROUTINE thincurr_freq_response
 !---------------------------------------------------------------------------------
 !> Needs docs
 !---------------------------------------------------------------------------------
-SUBROUTINE thincurr_time_domain(tw_ptr,direct,dt,nsteps,cg_tol,timestep_cn,nstatus,nplot, &
+SUBROUTINE thincurr_time_domain(tw_ptr,direct,dt,nsteps,cg_atol,cg_rtol,timestep_cn,nstatus,nplot, &
   vec_ic,sensor_ptr,ncurr,curr_ptr,nvolt,volt_ptr,volts_full,sensor_vals_ptr,hodlr_ptr,error_str) BIND(C,NAME="thincurr_time_domain")
 TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr !< Needs docs
 LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: direct !< Needs docs
 REAL(KIND=c_double), VALUE, INTENT(in) :: dt !< Needs docs
 INTEGER(KIND=c_int), VALUE, INTENT(in) :: nsteps !< Needs docs
-REAL(KIND=c_double), VALUE, INTENT(in) :: cg_tol !< Needs docs
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_atol !< Needs docs
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_rtol !< Needs docs
 LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: timestep_cn !< Needs docs
 INTEGER(KIND=c_int), VALUE, INTENT(in) :: nstatus !< Needs docs
 INTEGER(KIND=c_int), VALUE, INTENT(in) :: nplot !< Needs docs
@@ -1018,10 +1026,10 @@ CALL c_f_pointer(vec_ic, ic_tmp, [tw_obj%nelems])
 pm_save=oft_env%pm; oft_env%pm=.FALSE.
 IF(c_associated(hodlr_ptr))THEN
   CALL c_f_pointer(hodlr_ptr, hodlr_op)
-  CALL run_td_sim(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),cg_tol,LOGICAL(timestep_cn), &
+  CALL run_td_sim(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),[cg_atol,cg_rtol],LOGICAL(timestep_cn), &
     nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform,hodlr_op=hodlr_op)
 ELSE
-  CALL run_td_sim(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),cg_tol,LOGICAL(timestep_cn), &
+  CALL run_td_sim(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),[cg_atol,cg_rtol],LOGICAL(timestep_cn), &
     nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform)
 END IF
 oft_env%pm=pm_save

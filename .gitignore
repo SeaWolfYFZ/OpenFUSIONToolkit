@@ -38,3 +38,7 @@ app/**/build*
 # app/**/oftcppin
 app/**/*.h5
 app/**/*.xml
+
+# Workflow products
+src/examples/TokaMaker/AdvancedWorkflows/IsofluxController/IODATA*
+src/examples/TokaMaker/AdvancedWorkflows/IsofluxController/__pycache__*

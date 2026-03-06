@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # OFT库配置
-set(OFT_ROOT "/home/yfz/project/OpenFUSIONToolkit-251222")
+set(OFT_ROOT "/home/yfz/project/OpenFUSIONToolkit-260305")
 set(OFT_BUILD_LIB "${OFT_ROOT}/build_release/bin/liboftpy.so")
 set(OFT_INSTALL_LIB "${OFT_ROOT}/install_release/bin/liboftpy.so")
 

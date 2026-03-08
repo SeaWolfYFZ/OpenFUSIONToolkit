@@ -27,7 +27,8 @@ USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_
   tw_recon_curr, tw_compute_Bops
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
-  tw_reduce_model, run_td_sim, plot_td_sim
+  tw_reduce_model, run_td_sim, plot_td_sim, td_sim_state, run_td_sim_init, &
+  run_td_sim_advancestep, run_td_sim_finalize, run_td_sim_2
 USE mhd_utils, ONLY: mu0
 !---Wrappers
 USE oft_base_f, ONLY: copy_string, copy_string_rev
@@ -1069,4 +1070,280 @@ ELSE
 END IF
 IF(.NOT.c_associated(sensor_ptr))DEALLOCATE(sensors)
 END SUBROUTINE thincurr_reduce_model
+
+!=================================================================================
+! STEP-BY-STEP TIME-DOMAIN SIMULATION C INTERFACE
+!=================================================================================
+
+!---------------------------------------------------------------------------------
+!> Initialize step-by-step time-domain simulation
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_init(tw_ptr, state_ptr, direct, dt, nsteps, cg_atol, cg_rtol, &
+                            timestep_cn, nstatus, nplot, vec_ic, sensor_ptr, ncurr, &
+                            curr_ptr, nvolt, volt_ptr, volts_full, sensor_vals_ptr, &
+                            hodlr_ptr, error_str) BIND(C,NAME="thincurr_td_init")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), INTENT(out) :: state_ptr
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: direct
+REAL(KIND=c_double), VALUE, INTENT(in) :: dt
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nsteps
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_atol
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_rtol
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: timestep_cn
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nstatus
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nplot
+TYPE(c_ptr), VALUE, INTENT(in) :: vec_ic
+TYPE(c_ptr), VALUE, INTENT(in) :: sensor_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: ncurr
+TYPE(c_ptr), VALUE, INTENT(in) :: curr_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nvolt
+TYPE(c_ptr), VALUE, INTENT(in) :: volt_ptr
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: volts_full
+TYPE(c_ptr), VALUE, INTENT(in) :: sensor_vals_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: hodlr_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+LOGICAL :: pm_save
+REAL(8), CONTIGUOUS, POINTER :: ic_tmp(:),curr_waveform(:,:),volt_waveform(:,:),sensor_waveform(:,:)
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(tw_sensors), POINTER :: sensors
+TYPE(oft_tw_hodlr_op), POINTER :: hodlr_op
+TYPE(td_sim_state), POINTER :: state
+CALL copy_string('',error_str)
+CALL c_f_pointer(tw_ptr, tw_obj)
+IF(tw_obj%nelems<=0)THEN
+  CALL copy_string('Invalid ThinCurr model, may not be setup yet',error_str)
+  RETURN
+END IF
+IF(direct.AND.(c_associated(hodlr_ptr)))THEN
+  CALL copy_string('"direct=True" not supported with HODLR compression',error_str)
+  RETURN
+END IF
+IF((.NOT.ASSOCIATED(tw_obj%Lmat)).AND.(.NOT.c_associated(hodlr_ptr)))THEN
+  CALL copy_string('Inductance matrix required, but not computed',error_str)
+  RETURN
+END IF
+IF(.NOT.ASSOCIATED(tw_obj%Rmat))THEN
+  CALL copy_string('Resistance matrix required, but not computed',error_str)
+  RETURN
+END IF
+IF(c_associated(sensor_ptr))THEN
+  CALL c_f_pointer(sensor_ptr, sensors)
+ELSE
+  ALLOCATE(sensors)
+END IF
+IF(ncurr>0)THEN
+  CALL c_f_pointer(curr_ptr, curr_waveform, [ncurr,tw_obj%n_icoils+1])
+ELSE
+  NULLIFY(curr_waveform)
+END IF
+IF(nvolt>0)THEN
+  IF(volts_full)THEN
+    CALL c_f_pointer(volt_ptr, volt_waveform, [nvolt,tw_obj%nelems+1])
+  ELSE
+    CALL c_f_pointer(volt_ptr, volt_waveform, [nvolt,tw_obj%n_vcoils+1])
+  END IF
+ELSE
+  NULLIFY(volt_waveform)
+END IF
+IF(c_associated(sensor_vals_ptr))THEN
+  IF(.NOT.c_associated(sensor_ptr))THEN
+    CALL copy_string('Sensor object required with sensor waveform',error_str)
+    RETURN
+  END IF
+  IF(.NOT.ASSOCIATED(volt_waveform))THEN
+    CALL copy_string('Voltage waveform required with sensor waveform',error_str)
+    RETURN
+  END IF
+  CALL c_f_pointer(sensor_vals_ptr, sensor_waveform, [nvolt,sensors%nfloops+1])
+ELSE
+  NULLIFY(sensor_waveform)
+END IF
+CALL c_f_pointer(vec_ic, ic_tmp, [tw_obj%nelems])
+!---Allocate state object
+ALLOCATE(state)
+state_ptr=C_LOC(state)
+!---Run initialization
+pm_save=oft_env%pm; oft_env%pm=.FALSE.
+IF(c_associated(hodlr_ptr))THEN
+  CALL c_f_pointer(hodlr_ptr, hodlr_op)
+  CALL run_td_sim_init(tw_obj, state, dt, nsteps, ic_tmp, LOGICAL(direct), [cg_atol,cg_rtol], &
+    LOGICAL(timestep_cn), nstatus, nplot, sensors, curr_waveform, volt_waveform, &
+    sensor_waveform, hodlr_op)
+ELSE
+  CALL run_td_sim_init(tw_obj, state, dt, nsteps, ic_tmp, LOGICAL(direct), [cg_atol,cg_rtol], &
+    LOGICAL(timestep_cn), nstatus, nplot, sensors, curr_waveform, volt_waveform, &
+    sensor_waveform)
+END IF
+oft_env%pm=pm_save
+END SUBROUTINE thincurr_td_init
+
+!---------------------------------------------------------------------------------
+!> Advance time-domain simulation by one step
+!!
+!! External code should set icoil_curr, icoil_dcurr, and pcoil_volt arrays.
+!! These values are copied to the state before advancing the step.
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_step(tw_ptr, state_ptr, icoil_curr_ptr, icoil_dcurr_ptr, &
+                            pcoil_volt_ptr, nstatus, nplot, t_out, sol_norm_out, nits_out, &
+                            error_str) BIND(C,NAME="thincurr_td_step")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: state_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: icoil_curr_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: icoil_dcurr_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: pcoil_volt_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nstatus
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nplot
+REAL(KIND=c_double), INTENT(out) :: t_out
+REAL(KIND=c_double), INTENT(out) :: sol_norm_out
+INTEGER(KIND=c_int), INTENT(out) :: nits_out
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+REAL(8), CONTIGUOUS, POINTER :: icoil_curr_tmp(:), icoil_dcurr_tmp(:), pcoil_volt_tmp(:)
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(td_sim_state), POINTER :: state
+CALL copy_string('',error_str)
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(state_ptr, state)
+
+!---Copy external coil currents to state arrays
+IF(c_associated(icoil_curr_ptr) .AND. tw_obj%n_icoils>0)THEN
+  CALL c_f_pointer(icoil_curr_ptr, icoil_curr_tmp, [tw_obj%n_icoils])
+  state%icoil_curr = icoil_curr_tmp
+END IF
+
+IF(c_associated(icoil_dcurr_ptr) .AND. tw_obj%n_icoils>0)THEN
+  CALL c_f_pointer(icoil_dcurr_ptr, icoil_dcurr_tmp, [tw_obj%n_icoils])
+  state%icoil_dcurr = icoil_dcurr_tmp
+END IF
+
+IF(c_associated(pcoil_volt_ptr) .AND. tw_obj%n_vcoils>0)THEN
+  CALL c_f_pointer(pcoil_volt_ptr, pcoil_volt_tmp, [tw_obj%n_vcoils])
+  state%pcoil_volt = pcoil_volt_tmp
+END IF
+
+!---Advance step
+CALL run_td_sim_advancestep(state, nstatus=nstatus, nplot=nplot, &
+  t_out=t_out, sol_norm_out=sol_norm_out, nits_out=nits_out)
+END SUBROUTINE thincurr_td_step
+
+!---------------------------------------------------------------------------------
+!> Finalize step-by-step time-domain simulation
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_finalize(tw_ptr, state_ptr, vec_out, error_str) BIND(C,NAME="thincurr_td_finalize")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), INTENT(inout) :: state_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: vec_out
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+REAL(8), CONTIGUOUS, POINTER :: vec_tmp(:)
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(td_sim_state), POINTER :: state
+CALL copy_string('',error_str)
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(state_ptr, state)
+IF(c_associated(vec_out))THEN
+  CALL c_f_pointer(vec_out, vec_tmp, [tw_obj%nelems])
+  CALL run_td_sim_finalize(state, vec_tmp)
+ELSE
+  CALL run_td_sim_finalize(state)
+END IF
+DEALLOCATE(state)
+state_ptr=c_null_ptr
+END SUBROUTINE thincurr_td_finalize
+
+!---------------------------------------------------------------------------------
+!> Time-domain simulation wrapper (calls init/step/finalize internally)
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_time_domain_2(tw_ptr,direct,dt,nsteps,cg_atol,cg_rtol,timestep_cn,nstatus,nplot, &
+  vec_ic,sensor_ptr,ncurr,curr_ptr,nvolt,volt_ptr,volts_full,sensor_vals_ptr,hodlr_ptr,error_str) BIND(C,NAME="thincurr_time_domain_2")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: direct
+REAL(KIND=c_double), VALUE, INTENT(in) :: dt
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nsteps
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_atol
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_rtol
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: timestep_cn
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nstatus
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nplot
+TYPE(c_ptr), VALUE, INTENT(in) :: vec_ic
+TYPE(c_ptr), VALUE, INTENT(in) :: sensor_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: ncurr
+TYPE(c_ptr), VALUE, INTENT(in) :: curr_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: nvolt
+TYPE(c_ptr), VALUE, INTENT(in) :: volt_ptr
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: volts_full
+TYPE(c_ptr), VALUE, INTENT(in) :: sensor_vals_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: hodlr_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+LOGICAL :: pm_save
+REAL(8), CONTIGUOUS, POINTER :: ic_tmp(:),curr_waveform(:,:),volt_waveform(:,:),sensor_waveform(:,:)
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(tw_sensors), POINTER :: sensors
+TYPE(oft_tw_hodlr_op), POINTER :: hodlr_op
+CALL c_f_pointer(tw_ptr, tw_obj)
+IF(tw_obj%nelems<=0)THEN
+  CALL copy_string('Invalid ThinCurr model, may not be setup yet',error_str)
+  RETURN
+END IF
+IF(direct.AND.(c_associated(hodlr_ptr)))THEN
+  CALL copy_string('"direct=True" not supported with HODLR compression',error_str)
+  RETURN
+END IF
+IF((.NOT.ASSOCIATED(tw_obj%Lmat)).AND.(.NOT.c_associated(hodlr_ptr)))THEN
+  CALL copy_string('Inductance matrix required, but not computed',error_str)
+  RETURN
+END IF
+IF(.NOT.ASSOCIATED(tw_obj%Rmat))THEN
+  CALL copy_string('Resistance matrix required, but not computed',error_str)
+  RETURN
+END IF
+CALL copy_string('',error_str)
+IF(c_associated(sensor_ptr))THEN
+  CALL c_f_pointer(sensor_ptr, sensors)
+ELSE
+  ALLOCATE(sensors)
+END IF
+IF(ncurr>0)THEN
+  CALL c_f_pointer(curr_ptr, curr_waveform, [ncurr,tw_obj%n_icoils+1])
+ELSE
+  NULLIFY(curr_waveform)
+END IF
+IF(nvolt>0)THEN
+  IF(volts_full)THEN
+    CALL c_f_pointer(volt_ptr, volt_waveform, [nvolt,tw_obj%nelems+1])
+  ELSE
+    CALL c_f_pointer(volt_ptr, volt_waveform, [nvolt,tw_obj%n_vcoils+1])
+  END IF
+ELSE
+  NULLIFY(volt_waveform)
+END IF
+IF(c_associated(sensor_vals_ptr))THEN
+  IF(.NOT.c_associated(sensor_ptr))THEN
+    CALL copy_string('Sensor object required with sensor waveform',error_str)
+    RETURN
+  END IF
+  IF(.NOT.ASSOCIATED(volt_waveform))THEN
+    CALL copy_string('Voltage waveform required with sensor waveform',error_str)
+    RETURN
+  END IF
+  CALL c_f_pointer(sensor_vals_ptr, sensor_waveform, [nvolt,sensors%nfloops+1])
+ELSE
+  NULLIFY(sensor_waveform)
+END IF
+CALL c_f_pointer(vec_ic, ic_tmp, [tw_obj%nelems])
+!---Run simulation using run_td_sim_2
+pm_save=oft_env%pm; oft_env%pm=.FALSE.
+IF(c_associated(hodlr_ptr))THEN
+  CALL c_f_pointer(hodlr_ptr, hodlr_op)
+  CALL run_td_sim_2(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),[cg_atol,cg_rtol],LOGICAL(timestep_cn), &
+    nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform,hodlr_op)
+ELSE
+  CALL run_td_sim_2(tw_obj,dt,nsteps,ic_tmp,LOGICAL(direct),[cg_atol,cg_rtol],LOGICAL(timestep_cn), &
+    nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_waveform)
+END IF
+oft_env%pm=pm_save
+END SUBROUTINE thincurr_time_domain_2
+
 END MODULE thincurr_f

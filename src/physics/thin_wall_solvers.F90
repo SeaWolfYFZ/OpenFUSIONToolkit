@@ -32,6 +32,44 @@ USE thin_wall
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op, oft_tw_hodlr_bjpre, oft_tw_hodlr_rbjpre
 IMPLICIT NONE
 #include "local.h"
+TYPE :: tw_td_state
+  TYPE(tw_type), POINTER :: self => NULL()
+  TYPE(tw_sensors), POINTER :: sensors => NULL()
+  TYPE(oft_tw_hodlr_op), POINTER :: hodlr_op => NULL()
+  LOGICAL :: own_sensors = .FALSE.
+  LOGICAL :: pm_save = .FALSE.
+  LOGICAL :: direct = .FALSE.
+  LOGICAL :: use_cn = .FALSE.
+  LOGICAL :: use_hodlr = .FALSE.
+  LOGICAL :: volt_full = .FALSE.
+  LOGICAL :: floop_open = .FALSE.
+  LOGICAL :: jumper_open = .FALSE.
+  INTEGER(i4) :: nsteps = 0
+  INTEGER(i4) :: istep = 0
+  INTEGER(i4) :: nstatus = 0
+  INTEGER(i4) :: nplot = 0
+  REAL(r8) :: dt = 0.d0
+  REAL(r8) :: t = 0.d0
+  REAL(r8) :: lin_tols(2) = 0.d0
+  CLASS(oft_vector), POINTER :: u => NULL()
+  CLASS(oft_vector), POINTER :: up => NULL()
+  CLASS(oft_vector), POINTER :: du => NULL()
+  CLASS(oft_vector), POINTER :: g => NULL()
+  TYPE(oft_native_dense_matrix), POINTER :: Lmat_dense => NULL()
+  TYPE(oft_native_dense_matrix), POINTER :: Minv => NULL()
+  TYPE(oft_sum_matrix), POINTER :: fmat => NULL()
+  TYPE(oft_sum_matrix), POINTER :: bmat => NULL()
+  CLASS(oft_solver), POINTER :: linv => NULL()
+  REAL(r8), POINTER :: vals(:) => NULL()
+  REAL(r8), ALLOCATABLE :: icoil_curr(:)
+  REAL(r8), ALLOCATABLE :: icoil_dcurr(:)
+  REAL(r8), ALLOCATABLE :: pcoil_volt(:)
+  REAL(r8), ALLOCATABLE :: senout(:)
+  REAL(r8), ALLOCATABLE :: jumpout(:)
+  TYPE(oft_bin_file) :: floop_hist
+  TYPE(oft_bin_file) :: jumper_hist
+  TYPE(oft_timer) :: solve_timer
+END TYPE tw_td_state
 CONTAINS
 !---------------------------------------------------------------------------------
 !> Compute L/R eigenmodes of ThinCurr model using a direct approach via LAPACK
@@ -619,6 +657,464 @@ END IF
 oft_env%pm=pm
 END SUBROUTINE gmres_comp
 END SUBROUTINE frequency_response
+!---------------------------------------------------------------------------------
+!> Needs Docs
+!---------------------------------------------------------------------------------
+SUBROUTINE td_apply_Lmat(state,u,g)
+TYPE(tw_td_state), INTENT(inout) :: state
+CLASS(oft_vector), INTENT(inout) :: u
+CLASS(oft_vector), INTENT(inout) :: g
+IF(state%use_hodlr)THEN
+  CALL state%hodlr_op%apply(u,g)
+ELSE
+  CALL state%Lmat_dense%apply(u,g)
+END IF
+END SUBROUTINE td_apply_Lmat
+!---------------------------------------------------------------------------------
+!> Needs Docs
+!---------------------------------------------------------------------------------
+SUBROUTINE td_save_plot(state)
+TYPE(tw_td_state), INTENT(inout) :: state
+CHARACTER(LEN=4) :: pltnum
+WRITE(pltnum,'(I4.4)')state%istep
+CALL tw_rst_save(state%self,state%u,'pThinCurr_'//pltnum//'.rst','U')
+CALL hdf5_write(state%t,'pThinCurr_'//pltnum//'.rst','time')
+CALL hdf5_write(state%icoil_curr,'pThinCurr_'//pltnum//'.rst','coil_currents')
+END SUBROUTINE td_save_plot
+!---------------------------------------------------------------------------------
+!> Needs Docs
+!---------------------------------------------------------------------------------
+SUBROUTINE td_write_history(state)
+TYPE(tw_td_state), INTENT(inout) :: state
+INTEGER(4) :: i,j,k,ind1
+REAL(8) :: tmp,val_prev
+CHARACTER(LEN=15) :: hole_jumper_name
+CALL state%u%get_local(state%vals)
+IF(state%sensors%nfloops>0)THEN
+  IF(.NOT.ALLOCATED(state%senout))ALLOCATE(state%senout(state%sensors%nfloops+1))
+  CALL dgemv('N',state%sensors%nfloops,state%self%nelems,1.d0,state%self%Ael2sen,state%sensors%nfloops, &
+    state%vals,1,0.d0,state%senout(2),1)
+  IF(state%self%n_icoils>0)THEN
+    CALL dgemv('N',state%sensors%nfloops,state%self%n_icoils,1.d0,state%self%Adr2sen,state%sensors%nfloops, &
+      state%icoil_curr,1,1.d0,state%senout(2),1)
+  END IF
+  state%senout(1)=state%t
+  IF(.NOT.state%floop_open)THEN
+    state%floop_hist%filedesc = 'ThinCurr flux loop history file'
+    CALL state%floop_hist%setup('floops.hist')
+    CALL state%floop_hist%add_field('time', 'r8', desc="Simulation time [s]")
+    DO i=1,state%sensors%nfloops
+      CALL state%floop_hist%add_field(state%sensors%floops(i)%name, 'r8')
+    END DO
+    CALL state%floop_hist%write_header
+    CALL state%floop_hist%open
+    state%floop_open=.TRUE.
+  END IF
+  CALL state%floop_hist%write(data_r8=state%senout)
+END IF
+IF(state%sensors%njumpers+state%self%nholes>0)THEN
+  IF(.NOT.ALLOCATED(state%jumpout))ALLOCATE(state%jumpout(state%sensors%njumpers+state%self%nholes+1))
+  DO j=1,state%sensors%njumpers
+    tmp=0.d0
+    val_prev=0.d0
+    ind1=state%self%pmap(state%sensors%jumpers(j)%points(1))
+    IF(ind1>0)val_prev=state%vals(ind1)
+    DO k=1,state%sensors%jumpers(j)%np-1
+      ind1=state%self%pmap(state%sensors%jumpers(j)%points(k+1))
+      IF(ind1>0)THEN
+        tmp=tmp+state%vals(ind1)-val_prev
+        val_prev=state%vals(ind1)
+      ELSE
+        tmp=tmp-val_prev
+        val_prev=0.d0
+      END IF
+    END DO
+    DO k=1,state%self%nholes
+      tmp=tmp+state%vals(state%self%np_active+k)*state%sensors%jumpers(j)%hole_facs(k)
+    END DO
+    state%jumpout(j+1)=tmp/mu0
+  END DO
+  DO j=1,state%self%nholes
+    state%jumpout(state%sensors%njumpers+j+1)=state%vals(state%self%np_active+j)/mu0
+  END DO
+  state%jumpout(1)=state%t
+  IF(.NOT.state%jumper_open)THEN
+    state%jumper_hist%filedesc = 'ThinCurr current jumper history file'
+    CALL state%jumper_hist%setup('jumpers.hist')
+    CALL state%jumper_hist%add_field('time', 'r8', desc="Simulation time [s]")
+    DO i=1,state%sensors%njumpers
+      CALL state%jumper_hist%add_field(state%sensors%jumpers(i)%name, 'r8')
+    END DO
+    DO i=1,state%self%nholes
+      WRITE(hole_jumper_name,'(A,I4.4)')'HOLE_',i
+      CALL state%jumper_hist%add_field(hole_jumper_name, 'r8')
+    END DO
+    CALL state%jumper_hist%write_header
+    CALL state%jumper_hist%open
+    state%jumper_open=.TRUE.
+  END IF
+  CALL state%jumper_hist%write(data_r8=state%jumpout)
+END IF
+END SUBROUTINE td_write_history
+!---------------------------------------------------------------------------------
+!> Needs Docs
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_sim_init(self,dt,nsteps,vec,direct,lin_tols,use_cn,nstatus,nplot,sensors,state,hodlr_op,icoil_curr0,volts_full)
+TYPE(tw_type), TARGET, INTENT(in) :: self
+REAL(8), INTENT(in) :: dt
+INTEGER(4), INTENT(in) :: nsteps
+REAL(8), INTENT(in) :: vec(:)
+LOGICAL, INTENT(in) :: direct
+REAL(8), INTENT(in) :: lin_tols(2)
+LOGICAL, INTENT(in) :: use_cn
+INTEGER(4), INTENT(in) :: nstatus
+INTEGER(4), INTENT(in) :: nplot
+TYPE(tw_sensors), TARGET, INTENT(in) :: sensors
+TYPE(tw_td_state), POINTER, INTENT(out) :: state
+TYPE(oft_tw_hodlr_op), TARGET, OPTIONAL, INTENT(inout) :: hodlr_op
+REAL(8), OPTIONAL, INTENT(in) :: icoil_curr0(:)
+LOGICAL, OPTIONAL, INTENT(in) :: volts_full
+INTEGER(4) :: i,j,info
+REAL(8) :: dt_op
+ALLOCATE(state)
+state%self=>self
+state%sensors=>sensors
+state%direct=direct
+state%use_cn=use_cn
+state%nsteps=nsteps
+state%nstatus=nstatus
+state%nplot=nplot
+state%dt=dt
+state%lin_tols=lin_tols
+state%istep=0
+state%t=0.d0
+IF(PRESENT(volts_full))state%volt_full=volts_full
+IF(PRESENT(hodlr_op))THEN
+  state%use_hodlr=.TRUE.
+  state%hodlr_op=>hodlr_op
+END IF
+IF((self%n_icoils>0).AND.(.NOT.ASSOCIATED(self%Ael2dr)))THEN
+  CALL oft_abort('Coil mutual matrices required for time-domain stepping','run_td_sim_init',__FILE__)
+END IF
+WRITE(*,*)
+WRITE(*,'(2A)')oft_indent,'Starting time-domain simulation'
+CALL oft_increase_indent
+WRITE(*,'(2A)')oft_indent,'timestep    time           sol_norm     nits    solver time'
+CALL self%Uloc%new(state%u)
+CALL self%Uloc%new(state%up)
+CALL self%Uloc%new(state%du)
+CALL self%Uloc%new(state%g)
+ALLOCATE(state%vals(self%nelems))
+state%vals=vec
+CALL state%u%restore_local(state%vals)
+CALL state%up%add(0.d0,1.d0,state%u)
+ALLOCATE(state%icoil_curr(self%n_icoils),state%icoil_dcurr(self%n_icoils))
+state%icoil_curr=0.d0
+state%icoil_dcurr=0.d0
+IF(PRESENT(icoil_curr0))THEN
+  IF(SIZE(icoil_curr0)/=self%n_icoils)CALL oft_abort('Initial icoil current size mismatch','run_td_sim_init',__FILE__)
+  state%icoil_curr=icoil_curr0
+END IF
+IF(state%volt_full)THEN
+  ALLOCATE(state%pcoil_volt(self%nelems))
+ELSE
+  ALLOCATE(state%pcoil_volt(self%n_vcoils))
+END IF
+state%pcoil_volt=0.d0
+IF(state%use_hodlr.AND.direct)CALL oft_abort('"direct=True" not supported with HODLR compression','run_td_sim_init',__FILE__)
+IF(.NOT.state%use_hodlr)THEN
+  ALLOCATE(state%Lmat_dense)
+  state%Lmat_dense%nr=self%nelems; state%Lmat_dense%nc=self%nelems
+  state%Lmat_dense%nrg=self%nelems; state%Lmat_dense%ncg=self%nelems
+  state%Lmat_dense%M=>self%Lmat
+END IF
+IF(use_cn)THEN
+  dt_op=dt/2.d0
+  ALLOCATE(state%bmat)
+  state%bmat%nr=self%nelems; state%bmat%nc=self%nelems
+  state%bmat%nrg=self%nelems; state%bmat%ncg=self%nelems
+  IF(state%use_hodlr)THEN
+    state%bmat%J=>state%hodlr_op
+  ELSE
+    state%bmat%J=>state%Lmat_dense
+  END IF
+  state%bmat%K=>self%Rmat
+  state%bmat%alam = -dt_op
+ELSE
+  dt_op=dt
+END IF
+IF(.NOT.direct)THEN
+  ALLOCATE(state%fmat)
+  state%fmat%nr=self%nelems; state%fmat%nc=self%nelems
+  state%fmat%nrg=self%nelems; state%fmat%ncg=self%nelems
+  IF(state%use_hodlr)THEN
+    state%fmat%J=>state%hodlr_op
+  ELSE
+    state%fmat%J=>state%Lmat_dense
+  END IF
+  state%fmat%K=>self%Rmat
+  state%fmat%alam = dt_op
+  CALL state%fmat%assemble(state%u)
+  CALL create_cg_solver(state%linv)
+  state%linv%A=>state%fmat
+  state%linv%its=-2
+  state%linv%atol=lin_tols(1)
+  state%linv%rtol=lin_tols(2)
+  IF(state%use_hodlr)THEN
+    ALLOCATE(oft_tw_hodlr_rbjpre::state%linv%pre)
+    SELECT TYPE(pre=>state%linv%pre)
+    CLASS IS(oft_tw_hodlr_rbjpre)
+      pre%mf_obj=>state%hodlr_op
+      pre%Rmat=>self%Rmat
+      pre%alpha=1.d0
+      pre%beta=state%fmat%alam
+    CLASS DEFAULT
+      CALL oft_abort('Unable to allocate HODLR preconditioner','run_td_sim_init',__FILE__)
+    END SELECT
+  ELSE
+    CALL create_diag_pre(state%linv%pre)
+  END IF
+ELSE
+  ALLOCATE(state%Minv)
+  state%Minv%nr=self%nelems; state%Minv%nc=self%nelems
+  state%Minv%nrg=self%nelems; state%Minv%ncg=self%nelems
+  ALLOCATE(state%Minv%M(state%Minv%nr,state%Minv%nr))
+  state%Minv%M=self%Lmat
+  DO i=1,self%Rmat%nr
+    DO j=self%Rmat%kr(i),self%Rmat%kr(i+1)-1
+      state%Minv%M(i,self%Rmat%lc(j))=state%Minv%M(i,self%Rmat%lc(j)) + dt_op*self%Rmat%M(j)
+    END DO
+  END DO
+  WRITE(*,'(2A)')oft_indent,'Starting factorization'
+  CALL lapack_cholesky(state%Minv%nr,state%Minv%M,info)
+END IF
+CALL td_save_plot(state)
+CALL td_write_history(state)
+END SUBROUTINE run_td_sim_init
+!---------------------------------------------------------------------------------
+!> Needs Docs
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_sim_step(state,icoil_curr_in,icoil_dcurr_in,pcoil_volt_in,nstatus,nplot,sol_norm_out,nits_out,t_out)
+TYPE(tw_td_state), INTENT(inout) :: state
+REAL(8), INTENT(in) :: icoil_curr_in(:)
+REAL(8), INTENT(in) :: icoil_dcurr_in(:)
+REAL(8), INTENT(in) :: pcoil_volt_in(:)
+INTEGER(4), INTENT(in) :: nstatus
+INTEGER(4), INTENT(in) :: nplot
+REAL(8), OPTIONAL, INTENT(out) :: sol_norm_out
+INTEGER(4), OPTIONAL, INTENT(out) :: nits_out
+REAL(8), OPTIONAL, INTENT(out) :: t_out
+INTEGER(4) :: eff_status,eff_plot,j,nits
+REAL(8) :: elapsed_time,uu
+eff_status=state%nstatus
+IF(nstatus>0)eff_status=nstatus
+eff_plot=state%nplot
+IF(nplot>0)eff_plot=nplot
+IF(SIZE(icoil_curr_in)/=SIZE(state%icoil_curr))CALL oft_abort('icoil_curr size mismatch','run_td_sim_step',__FILE__)
+IF(SIZE(icoil_dcurr_in)/=SIZE(state%icoil_dcurr))CALL oft_abort('icoil_dcurr size mismatch','run_td_sim_step',__FILE__)
+IF(SIZE(pcoil_volt_in)/=SIZE(state%pcoil_volt))CALL oft_abort('pcoil_volt size mismatch','run_td_sim_step',__FILE__)
+state%icoil_curr=icoil_curr_in
+state%icoil_dcurr=icoil_dcurr_in
+state%pcoil_volt=pcoil_volt_in
+IF(state%use_cn)THEN
+  CALL state%bmat%apply(state%u,state%g)
+ELSE
+  CALL td_apply_Lmat(state,state%u,state%g)
+END IF
+CALL state%g%get_local(state%vals)
+IF(state%self%n_icoils>0)THEN
+  CALL dgemv('N',state%self%nelems,state%self%n_icoils,-1.d0,state%self%Ael2dr,state%self%nelems, &
+    state%icoil_dcurr,1,1.d0,state%vals,1)
+END IF
+IF(state%volt_full)THEN
+  state%vals=state%vals+state%pcoil_volt
+ELSE
+  DO j=1,state%self%n_vcoils
+    state%vals(state%self%np_active+state%self%nholes+j)=state%vals(state%self%np_active+state%self%nholes+j)+state%pcoil_volt(j)
+  END DO
+END IF
+CALL state%g%restore_local(state%vals)
+CALL state%solve_timer%tick()
+IF(state%direct)THEN
+  CALL state%Minv%apply(state%g,state%u)
+  nits=1
+ELSE
+  CALL state%du%add(0.d0,1.d0,state%u)
+  CALL state%du%add(1.d0,-1.d0,state%up)
+  CALL state%up%add(0.d0,1.d0,state%u)
+  CALL state%u%add(1.d0,1.d0,state%du)
+  CALL state%linv%apply(state%u,state%g)
+  nits=state%linv%cits
+END IF
+elapsed_time=state%solve_timer%tock()
+uu=SQRT(state%u%dot(state%u))
+state%t=state%t+state%dt
+state%istep=state%istep+1
+IF((eff_status>0).AND.(MOD(state%istep,eff_status)==0))WRITE(*,'(2X,I6,ES16.6,ES14.4,2X,I6,F12.2)') &
+  state%istep,state%t,uu,nits,elapsed_time
+IF((eff_plot>0).AND.(MOD(state%istep,eff_plot)==0))CALL td_save_plot(state)
+CALL td_write_history(state)
+IF(PRESENT(sol_norm_out))sol_norm_out=uu
+IF(PRESENT(nits_out))nits_out=nits
+IF(PRESENT(t_out))t_out=state%t
+END SUBROUTINE run_td_sim_step
+!---------------------------------------------------------------------------------
+!> Needs Docs
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_sim_finalize(state,vec_out)
+TYPE(tw_td_state), POINTER, INTENT(inout) :: state
+REAL(8), INTENT(out) :: vec_out(:)
+IF(.NOT.ASSOCIATED(state))RETURN
+CALL state%u%get_local(state%vals)
+vec_out=state%vals
+IF(state%floop_open)CALL state%floop_hist%close
+IF(state%jumper_open)CALL state%jumper_hist%close
+IF(ASSOCIATED(state%u))THEN
+  CALL state%u%delete()
+  DEALLOCATE(state%u)
+END IF
+IF(ASSOCIATED(state%up))THEN
+  CALL state%up%delete()
+  DEALLOCATE(state%up)
+END IF
+IF(ASSOCIATED(state%du))THEN
+  CALL state%du%delete()
+  DEALLOCATE(state%du)
+END IF
+IF(ASSOCIATED(state%g))THEN
+  CALL state%g%delete()
+  DEALLOCATE(state%g)
+END IF
+IF(ASSOCIATED(state%linv))THEN
+  IF(ASSOCIATED(state%linv%pre))THEN
+    CALL state%linv%pre%delete()
+    DEALLOCATE(state%linv%pre)
+  END IF
+  CALL state%linv%delete()
+  DEALLOCATE(state%linv)
+END IF
+IF(ASSOCIATED(state%Minv))THEN
+  IF(ASSOCIATED(state%Minv%M))DEALLOCATE(state%Minv%M)
+  DEALLOCATE(state%Minv)
+END IF
+IF(ASSOCIATED(state%fmat))DEALLOCATE(state%fmat)
+IF(ASSOCIATED(state%bmat))DEALLOCATE(state%bmat)
+IF(ASSOCIATED(state%Lmat_dense))DEALLOCATE(state%Lmat_dense)
+IF(ASSOCIATED(state%vals))DEALLOCATE(state%vals)
+IF(ALLOCATED(state%icoil_curr))DEALLOCATE(state%icoil_curr)
+IF(ALLOCATED(state%icoil_dcurr))DEALLOCATE(state%icoil_dcurr)
+IF(ALLOCATED(state%pcoil_volt))DEALLOCATE(state%pcoil_volt)
+IF(ALLOCATED(state%senout))DEALLOCATE(state%senout)
+IF(ALLOCATED(state%jumpout))DEALLOCATE(state%jumpout)
+IF(state%own_sensors.AND.ASSOCIATED(state%sensors))DEALLOCATE(state%sensors)
+DEALLOCATE(state)
+CALL oft_decrease_indent
+END SUBROUTINE run_td_sim_finalize
+!---------------------------------------------------------------------------------
+!> Needs Docs
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_sim_2(self,dt,nsteps,vec,direct,lin_tols,use_cn,nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_vals,hodlr_op)
+TYPE(tw_type), TARGET, INTENT(in) :: self
+REAL(8), INTENT(in) :: dt
+INTEGER(4), INTENT(in) :: nsteps
+REAL(8), INTENT(inout) :: vec(:)
+LOGICAL, INTENT(in) :: direct
+REAL(8), INTENT(in) :: lin_tols(2)
+LOGICAL, INTENT(in) :: use_cn
+INTEGER(4), INTENT(in) :: nstatus
+INTEGER(4), INTENT(in) :: nplot
+TYPE(tw_sensors), TARGET, INTENT(in) :: sensors
+REAL(8), POINTER, INTENT(in) :: curr_waveform(:,:)
+REAL(8), POINTER, INTENT(in) :: volt_waveform(:,:)
+REAL(8), POINTER, INTENT(in) :: sensor_vals(:,:)
+TYPE(oft_tw_hodlr_op), TARGET, OPTIONAL, INTENT(inout) :: hodlr_op
+INTEGER(4) :: i,j,ntimes_curr,ntimes_volt,int_inds(2),nits
+REAL(8) :: int_facs(2),uu
+REAL(8), ALLOCATABLE :: icoil_curr(:),icoil_dcurr(:),pcoil_volt(:),icoil_curr0(:)
+TYPE(tw_td_state), POINTER :: state
+DEBUG_STACK_PUSH
+IF(ASSOCIATED(sensor_vals))CONTINUE
+ALLOCATE(icoil_curr(self%n_icoils),icoil_dcurr(self%n_icoils),icoil_curr0(self%n_icoils))
+icoil_curr=0.d0
+icoil_dcurr=0.d0
+icoil_curr0=0.d0
+IF(ASSOCIATED(curr_waveform))THEN
+  ntimes_curr=SIZE(curr_waveform,DIM=1)
+  DO j=1,self%n_icoils
+    icoil_curr0(j)=linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,0.d0,1)
+  END DO
+ELSE
+  ntimes_curr=0
+END IF
+IF(ASSOCIATED(volt_waveform))THEN
+  ntimes_volt=SIZE(volt_waveform,DIM=1)
+  IF(SIZE(volt_waveform,DIM=2)-1==self%nelems)THEN
+    ALLOCATE(pcoil_volt(self%nelems))
+    CALL run_td_sim_init(self,dt,nsteps,vec,direct,lin_tols,use_cn,nstatus,nplot,sensors,state,hodlr_op,icoil_curr0,.TRUE.)
+  ELSE
+    ALLOCATE(pcoil_volt(self%n_vcoils))
+    CALL run_td_sim_init(self,dt,nsteps,vec,direct,lin_tols,use_cn,nstatus,nplot,sensors,state,hodlr_op,icoil_curr0,.FALSE.)
+  END IF
+ELSE
+  ntimes_volt=0
+  ALLOCATE(pcoil_volt(self%n_vcoils))
+  CALL run_td_sim_init(self,dt,nsteps,vec,direct,lin_tols,use_cn,nstatus,nplot,sensors,state,hodlr_op,icoil_curr0,.FALSE.)
+END IF
+DO i=1,nsteps
+  pcoil_volt=0.d0
+  icoil_curr=0.d0
+  icoil_dcurr=0.d0
+  IF(use_cn)THEN
+    IF(ntimes_curr>0)THEN
+      DO j=1,self%n_icoils
+        icoil_dcurr(j)=linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t+dt/4.d0,1)
+        icoil_dcurr(j)=icoil_dcurr(j)-linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t-dt/4.d0,1)
+        icoil_dcurr(j)=icoil_dcurr(j)+linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t+dt*5.d0/4.d0,1)
+        icoil_dcurr(j)=icoil_dcurr(j)-linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t+dt*3.d0/4.d0,1)
+        icoil_curr(j)=linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t+dt,1)
+      END DO
+    END IF
+    IF(ntimes_volt>0)THEN
+      IF(SIZE(pcoil_volt)==self%nelems)THEN
+        CALL linterp_facs(volt_waveform(:,1),ntimes_volt,state%t,int_inds,int_facs,1)
+        pcoil_volt=(volt_waveform(int_inds(1),2:)*int_facs(1)+volt_waveform(int_inds(2),2:)*int_facs(2))/2.d0
+        CALL linterp_facs(volt_waveform(:,1),ntimes_volt,state%t+dt,int_inds,int_facs,1)
+        pcoil_volt=pcoil_volt+(volt_waveform(int_inds(1),2:)*int_facs(1)+volt_waveform(int_inds(2),2:)*int_facs(2))/2.d0
+      ELSE
+        DO j=1,self%n_vcoils
+          pcoil_volt(j)=linterp(volt_waveform(:,1),volt_waveform(:,j+1),ntimes_volt,state%t,1)/2.d0
+          pcoil_volt(j)=pcoil_volt(j)+linterp(volt_waveform(:,1),volt_waveform(:,j+1),ntimes_volt,state%t+dt,1)/2.d0
+        END DO
+      END IF
+      pcoil_volt=pcoil_volt*dt
+    END IF
+  ELSE
+    IF(ntimes_curr>0)THEN
+      DO j=1,self%n_icoils
+        icoil_dcurr(j)=linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t+dt*5.d0/4.d0,1)
+        icoil_dcurr(j)=icoil_dcurr(j)-linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t+dt*3.d0/4.d0,1)
+        icoil_curr(j)=linterp(curr_waveform(:,1),curr_waveform(:,j+1),ntimes_curr,state%t+dt,1)
+      END DO
+      icoil_dcurr=icoil_dcurr*2.d0
+    END IF
+    IF(ntimes_volt>0)THEN
+      IF(SIZE(pcoil_volt)==self%nelems)THEN
+        CALL linterp_facs(volt_waveform(:,1),ntimes_volt,state%t+dt,int_inds,int_facs,1)
+        pcoil_volt=volt_waveform(int_inds(1),2:)*int_facs(1)+volt_waveform(int_inds(2),2:)*int_facs(2)
+      ELSE
+        DO j=1,self%n_vcoils
+          pcoil_volt(j)=linterp(volt_waveform(:,1),volt_waveform(:,j+1),ntimes_volt,state%t+dt,1)
+        END DO
+      END IF
+      pcoil_volt=pcoil_volt*dt
+    END IF
+  END IF
+  CALL run_td_sim_step(state,icoil_curr,icoil_dcurr,pcoil_volt,nstatus,nplot,uu,nits)
+END DO
+CALL run_td_sim_finalize(state,vec)
+DEALLOCATE(icoil_curr,icoil_dcurr,pcoil_volt,icoil_curr0)
+DEBUG_STACK_POP
+END SUBROUTINE run_td_sim_2
 !---------------------------------------------------------------------------------
 !> Needs Docs
 !---------------------------------------------------------------------------------

@@ -1,0 +1,90 @@
+// oft_capi.h
+// OpenFUSIONToolkit C API declarations
+// This file contains all extern "C" function declarations exposed by Fortran BIND(C)
+
+#ifndef OFT_CAPI_H
+#define OFT_CAPI_H
+
+#include <cstdint>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Constants matching Fortran module definitions
+#define OFT_PATH_SLEN 1024
+#define OFT_ERROR_SLEN 512
+#define OFT_SLEN 256
+
+// Initialization functions
+void oftpy_init(int32_t nthreads, const char* ifile, int32_t* slens, void* abort_callback);
+void oftpy_load_xml(const char* xml_file, void** oft_node_ptr);
+
+// ThinCurr setup functions
+void thincurr_setup(
+    const char* mesh_file, int32_t np, void* r_loc, int32_t nc, void* lc_loc,
+    void* reg_loc, void* pmap_loc, int32_t jumper_start_in, void** tw_ptr,
+    int32_t* sizes, char* error_str, void* xml_ptr
+);
+
+void thincurr_setup_io(void* tw_ptr, const char* basepath, bool save_debug,
+                      bool legacy_hdf5, char* error_str);
+
+// Matrix computation functions
+void thincurr_Mcoil(void* tw_ptr, void** Mc_ptr, const char* cache_file,
+                   char* error_str);
+
+void thincurr_Lmat(void* tw_ptr, bool use_hodlr, void** Lmat_ptr,
+                  const char* cache_file, char* error_str);
+
+void thincurr_Rmat(void* tw_ptr, bool copy_out, void* Rmat, char* error_str);
+
+// Time domain simulation
+void thincurr_time_domain(
+    void* tw_ptr, bool direct, double dt, int32_t nsteps, double lin_tol,
+    bool timestep_cn, int32_t status_freq, int32_t plot_freq, void* vec_ic,
+    void* sensor_ptr, int32_t ncurr, const double* curr_ptr, int32_t nvolt,
+    const double* volt_ptr, bool volts_full, void* sensor_vals_ptr,
+    void* hodlr_ptr, char* error_str
+);
+
+void thincurr_time_domain_2(
+    void* tw_ptr, bool direct, double dt, int32_t nsteps, double lin_tol,
+    bool timestep_cn, int32_t status_freq, int32_t plot_freq, void* vec_ic,
+    void* sensor_ptr, int32_t ncurr, const double* curr_ptr, int32_t nvolt,
+    const double* volt_ptr, bool volts_full, void* sensor_vals_ptr,
+    void* hodlr_ptr, char* error_str
+);
+
+// ThinCurr coupling interface: step-by-step time-domain simulation
+
+// Initialize simulation state; returns opaque state_ptr.
+// Call thincurr_td_advance() once per step, then thincurr_td_finalize().
+void thincurr_td_init(
+    void* tw_ptr, bool direct, double dt, double cg_atol, double cg_rtol,
+    bool timestep_cn, int32_t nstatus, int32_t nplot, void* vec_ic,
+    void* sensor_ptr, void* hodlr_ptr, void** state_ptr, char* error_str
+);
+
+// Advance simulation by one time step.
+// icoil_dcurr[n_icoil]: delta coil currents (pre-computed/interpolated by caller)
+// icoil_curr[n_icoil]:  coil currents at new time (for diagnostic output)
+// pcoil_volt[n_volt]:   voltage drives already scaled by dt (0 → no voltage drive)
+void thincurr_td_advance(
+    void* state_ptr, void* tw_ptr,
+    int32_t n_icoil, const double* icoil_dcurr, const double* icoil_curr,
+    int32_t n_volt,  const double* pcoil_volt,
+    void* sensor_ptr, void* hodlr_ptr, char* error_str
+);
+
+// Finalize simulation: copy solution to vec_out, close history files, free state.
+void thincurr_td_finalize(
+    void* state_ptr, void* tw_ptr, double* vec_out,
+    void* sensor_ptr, char* error_str
+);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // OFT_CAPI_H

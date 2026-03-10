@@ -12,6 +12,7 @@
 #include <fstream>
 #include <array>
 #include <algorithm>
+#include <cmath>
 
 int main(int argc, char* argv[]) {
     const char* hdf5_file_path = "tokamak_mesh_holes_16.h5";
@@ -54,8 +55,22 @@ int main(int argc, char* argv[]) {
     thincurr_Mcoil(tw_obj_ptr, &Mc_ptr, "", error_str);
     if (check_error(error_str, "thincurr_Mcoil")) return -1;
 
+    // NOTE: switching between HODLR and dense Lmat can help diagnose numerical mismatches
+    // between old and refactored time-domain interfaces.
+    const bool use_hodlr_L = true;
+
+    // Runs extra batch-mode references (old + new) to catch regressions.
+    // Keep this off for normal runs since it triples runtime and output files.
+    const bool run_regression_checks = false;
+
     log_info("run `thincurr_Lmat`");
-    thincurr_Lmat(tw_obj_ptr, true, &Lmat_hodlr_ptr, "DATA_HOLDR_L.save", error_str);
+    if (use_hodlr_L) {
+        thincurr_Lmat(tw_obj_ptr, true, &Lmat_hodlr_ptr, "DATA_HOLDR_L.save", error_str);
+    } else {
+        void* Lmat_dense_ptr = nullptr;
+        thincurr_Lmat(tw_obj_ptr, false, &Lmat_dense_ptr, "", error_str);
+        Lmat_hodlr_ptr = nullptr;
+    }
     if (check_error(error_str, "thincurr_Lmat")) return -1;
 
     log_info("run `thincurr_Rmat`");
@@ -141,6 +156,45 @@ int main(int argc, char* argv[]) {
     log_info("run `thincurr_td_finalize`");
     thincurr_td_finalize(tw_obj_ptr, td_state_ptr, vec_ic.data(), error_str);
     if (check_error(error_str, "thincurr_td_finalize")) return -1;
+
+    if (run_regression_checks) {
+        // -------------------------------------------------------------------------
+        // Regression check: compare against batch interfaces.
+        // This helps catch subtle differences in the refactor/state-machine path.
+        // -------------------------------------------------------------------------
+        auto max_abs_diff = [](const std::vector<double>& a, const std::vector<double>& b) -> double {
+            double m = 0.0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                m = std::max(m, std::abs(a[i] - b[i]));
+            }
+            return m;
+        };
+
+        std::vector<double> vec_ic_old(nelems, 0.0);
+        log_info("run reference `thincurr_time_domain` (old batch interface)");
+        thincurr_time_domain(
+            tw_obj_ptr, false, dt, nsteps, 1.0E-6, 1.0E-6, true, status_freq, 10,
+            vec_ic_old.data(), nullptr, n_time_points, coil_currs_transposed, 0, nullptr,
+            false, nullptr, Lmat_hodlr_ptr, error_str
+        );
+        if (check_error(error_str, "thincurr_time_domain")) return -1;
+
+        std::vector<double> vec_ic_newbatch(nelems, 0.0);
+        log_info("run reference `thincurr_time_domain_2` (new batch interface)");
+        thincurr_time_domain_2(
+            tw_obj_ptr, false, dt, nsteps, 1.0E-6, 1.0E-6, true, status_freq, 10,
+            vec_ic_newbatch.data(), nullptr, n_time_points, coil_currs_transposed, 0, nullptr,
+            false, nullptr, Lmat_hodlr_ptr, error_str
+        );
+        if (check_error(error_str, "thincurr_time_domain_2")) return -1;
+
+        const double d_step_vs_old = max_abs_diff(vec_ic, vec_ic_old);
+        const double d_step_vs_newbatch = max_abs_diff(vec_ic, vec_ic_newbatch);
+        const double d_old_vs_newbatch = max_abs_diff(vec_ic_old, vec_ic_newbatch);
+        log_info("max|vec(step) - vec(old)| = " + std::to_string(d_step_vs_old));
+        log_info("max|vec(step) - vec(newbatch)| = " + std::to_string(d_step_vs_newbatch));
+        log_info("max|vec(old) - vec(newbatch)| = " + std::to_string(d_old_vs_newbatch));
+    }
 
     log_info("Simulation Finished Successfully");
 

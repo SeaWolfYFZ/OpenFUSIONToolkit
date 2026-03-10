@@ -771,7 +771,7 @@ INTEGER(4), INTENT(in) :: nstatus
 INTEGER(4), INTENT(in) :: nplot
 TYPE(tw_sensors), TARGET, INTENT(in) :: sensors
 TYPE(tw_td_state), POINTER, INTENT(out) :: state
-TYPE(oft_tw_hodlr_op), TARGET, OPTIONAL, INTENT(inout) :: hodlr_op
+TYPE(oft_tw_hodlr_op), POINTER, OPTIONAL, INTENT(inout) :: hodlr_op
 REAL(8), OPTIONAL, INTENT(in) :: icoil_curr0(:)
 LOGICAL, OPTIONAL, INTENT(in) :: volts_full
 INTEGER(4) :: i,j,info
@@ -790,6 +790,7 @@ state%istep=0
 state%t=0.d0
 IF(PRESENT(volts_full))state%volt_full=volts_full
 IF(PRESENT(hodlr_op))THEN
+  IF(.NOT.ASSOCIATED(hodlr_op))CALL oft_abort('Invalid HODLR operator pointer','run_td_sim_init',__FILE__)
   state%use_hodlr=.TRUE.
   state%hodlr_op=>hodlr_op
 END IF
@@ -804,10 +805,6 @@ CALL self%Uloc%new(state%u)
 CALL self%Uloc%new(state%up)
 CALL self%Uloc%new(state%du)
 CALL self%Uloc%new(state%g)
-ALLOCATE(state%vals(self%nelems))
-state%vals=vec
-CALL state%u%restore_local(state%vals)
-CALL state%up%add(0.d0,1.d0,state%u)
 ALLOCATE(state%icoil_curr(self%n_icoils),state%icoil_dcurr(self%n_icoils))
 state%icoil_curr=0.d0
 state%icoil_dcurr=0.d0
@@ -888,6 +885,12 @@ ELSE
   WRITE(*,'(2A)')oft_indent,'Starting factorization'
   CALL lapack_cholesky(state%Minv%nr,state%Minv%M,info)
 END IF
+! Restore initial condition after solver/matrix setup, matching legacy `run_td_sim` ordering.
+! Some matrix wrappers may use the passed vector argument as scratch during `assemble`.
+ALLOCATE(state%vals(self%nelems))
+state%vals=vec
+CALL state%u%restore_local(state%vals)
+CALL state%up%add(0.d0,1.d0,state%u)
 CALL td_save_plot(state)
 CALL td_write_history(state)
 END SUBROUTINE run_td_sim_init
@@ -1027,7 +1030,7 @@ TYPE(tw_sensors), TARGET, INTENT(in) :: sensors
 REAL(8), POINTER, INTENT(in) :: curr_waveform(:,:)
 REAL(8), POINTER, INTENT(in) :: volt_waveform(:,:)
 REAL(8), POINTER, INTENT(in) :: sensor_vals(:,:)
-TYPE(oft_tw_hodlr_op), TARGET, OPTIONAL, INTENT(inout) :: hodlr_op
+TYPE(oft_tw_hodlr_op), POINTER, OPTIONAL, INTENT(inout) :: hodlr_op
 INTEGER(4) :: i,j,ntimes_curr,ntimes_volt,int_inds(2),nits
 REAL(8) :: int_facs(2),uu
 REAL(8), ALLOCATABLE :: icoil_curr(:),icoil_dcurr(:),pcoil_volt(:),icoil_curr0(:)

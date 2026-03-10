@@ -66,6 +66,12 @@ TYPE :: tw_td_state
   REAL(r8), ALLOCATABLE :: pcoil_volt(:)
   REAL(r8), ALLOCATABLE :: senout(:)
   REAL(r8), ALLOCATABLE :: jumpout(:)
+  ! Cached magnetic field reconstruction operators for an arbitrary set of points.
+  ! bpts layout matches the C interface: [3,n_bpts] with xyz per point.
+  INTEGER(i4) :: n_bpts = 0
+  REAL(r8), ALLOCATABLE :: bpts(:,:)
+  REAL(r8), ALLOCATABLE :: Bel_bpts(:,:,:)
+  REAL(r8), ALLOCATABLE :: Bdr_bpts(:,:,:)
   TYPE(oft_bin_file) :: floop_hist
   TYPE(oft_bin_file) :: jumper_hist
   TYPE(oft_timer) :: solve_timer
@@ -1009,6 +1015,9 @@ IF(ALLOCATED(state%icoil_dcurr))DEALLOCATE(state%icoil_dcurr)
 IF(ALLOCATED(state%pcoil_volt))DEALLOCATE(state%pcoil_volt)
 IF(ALLOCATED(state%senout))DEALLOCATE(state%senout)
 IF(ALLOCATED(state%jumpout))DEALLOCATE(state%jumpout)
+IF(ALLOCATED(state%bpts))DEALLOCATE(state%bpts)
+IF(ALLOCATED(state%Bel_bpts))DEALLOCATE(state%Bel_bpts)
+IF(ALLOCATED(state%Bdr_bpts))DEALLOCATE(state%Bdr_bpts)
 IF(state%own_sensors.AND.ASSOCIATED(state%sensors))DEALLOCATE(state%sensors)
 DEALLOCATE(state)
 CALL oft_decrease_indent

@@ -24,7 +24,7 @@ USE oft_la_base, ONLY: oft_vector
 USE fem_utils, ONLY: fem_interp
 USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_Rmat, &
   tw_compute_Ael2dr, tw_sensors, tw_compute_mutuals, tw_load_sensors, tw_compute_Lmat_MF, &
-  tw_recon_curr, tw_compute_Bops
+  tw_recon_curr, tw_compute_Bops, tw_compute_Bops_pts
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
   tw_reduce_model, run_td_sim, run_td_sim_2, run_td_sim_init, run_td_sim_step, run_td_sim_finalize, &
@@ -1217,6 +1217,119 @@ CALL c_f_pointer(vec_out, vec_tmp, [state%self%nelems])
 CALL run_td_sim_finalize(state,vec_tmp)
 oft_env%pm=pm_save
 END SUBROUTINE thincurr_td_finalize
+
+!---------------------------------------------------------------------------------
+!> Cache magnetic field reconstruction operators for an arbitrary set of points.
+!!
+!! pts_ptr points to a contiguous double array of length 3*npts laid out as:
+!!   [x0,y0,z0, x1,y1,z1, ...]
+!! which maps naturally to Fortran pts(3,npts).
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_set_bpoints(tw_ptr,state_ptr,npts,pts_ptr,error_str) BIND(C,NAME="thincurr_td_set_bpoints")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: state_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: npts
+TYPE(c_ptr), VALUE, INTENT(in) :: pts_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+REAL(8), POINTER :: pts_tmp(:,:)
+TYPE(tw_td_state), POINTER :: state
+CALL c_f_pointer(state_ptr, state)
+IF(.NOT.ASSOCIATED(state))THEN
+  CALL copy_string('Invalid time-domain state pointer',error_str)
+  RETURN
+END IF
+IF(npts<=0)THEN
+  CALL copy_string('npts must be > 0',error_str)
+  RETURN
+END IF
+IF(.NOT.c_associated(pts_ptr))THEN
+  CALL copy_string('pts_ptr required',error_str)
+  RETURN
+END IF
+CALL copy_string('',error_str)
+CALL c_f_pointer(pts_ptr, pts_tmp, [3,npts])
+!
+! Replace any existing cache.
+state%n_bpts = npts
+IF(ALLOCATED(state%bpts))DEALLOCATE(state%bpts)
+ALLOCATE(state%bpts(3,npts))
+state%bpts = pts_tmp
+IF(ALLOCATED(state%Bel_bpts))DEALLOCATE(state%Bel_bpts)
+IF(ALLOCATED(state%Bdr_bpts))DEALLOCATE(state%Bdr_bpts)
+CALL tw_compute_Bops_pts(state%self,state%bpts,state%Bel_bpts,state%Bdr_bpts)
+END SUBROUTINE thincurr_td_set_bpoints
+
+!---------------------------------------------------------------------------------
+!> Evaluate B at the cached point set for the current time-domain state.
+!!
+!! Bout_ptr points to a contiguous double array of length 3*npts laid out as:
+!!   [Bx0,By0,Bz0, Bx1,By1,Bz1, ...]
+!! which maps naturally to Fortran Bout(3,npts).
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_eval_bpoints(tw_ptr,state_ptr,npts,Bout_ptr,error_str) BIND(C,NAME="thincurr_td_eval_bpoints")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: state_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: npts
+TYPE(c_ptr), VALUE, INTENT(in) :: Bout_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+REAL(8), POINTER :: Bout(:,:)
+REAL(8), POINTER :: pot(:)
+INTEGER(4) :: k,j,jj
+REAL(8) :: tmp
+TYPE(tw_td_state), POINTER :: state
+CALL c_f_pointer(state_ptr, state)
+IF(.NOT.ASSOCIATED(state))THEN
+  CALL copy_string('Invalid time-domain state pointer',error_str)
+  RETURN
+END IF
+IF(npts<=0)THEN
+  CALL copy_string('npts must be > 0',error_str)
+  RETURN
+END IF
+IF(.NOT.c_associated(Bout_ptr))THEN
+  CALL copy_string('Bout_ptr required',error_str)
+  RETURN
+END IF
+IF(state%n_bpts/=npts)THEN
+  CALL copy_string('npts mismatch with cached B points',error_str)
+  RETURN
+END IF
+IF((.NOT.ALLOCATED(state%Bel_bpts)).OR.(.NOT.ALLOCATED(state%Bdr_bpts)))THEN
+  CALL copy_string('B-point operators not initialized; call thincurr_td_set_bpoints first',error_str)
+  RETURN
+END IF
+CALL copy_string('',error_str)
+CALL c_f_pointer(Bout_ptr, Bout, [3,npts])
+!
+NULLIFY(pot)
+CALL state%u%get_local(pot)
+Bout=0.d0
+!$omp parallel do private(j,jj,tmp)
+DO k=1,npts
+  DO jj=1,3
+    tmp=0.d0
+    !$omp simd reduction(+:tmp)
+    DO j=1,state%self%nelems
+      tmp=tmp+pot(j)*state%Bel_bpts(j,k,jj)
+    END DO
+    Bout(jj,k)=tmp
+  END DO
+END DO
+IF(state%self%n_icoils>0)THEN
+  !$omp parallel do private(j,jj,tmp)
+  DO k=1,npts
+    DO jj=1,3
+      tmp=0.d0
+      !$omp simd reduction(+:tmp)
+      DO j=1,state%self%n_icoils
+        tmp=tmp+state%icoil_curr(j)*state%Bdr_bpts(k,j,jj)
+      END DO
+      Bout(jj,k)=Bout(jj,k)+tmp
+    END DO
+  END DO
+END IF
+IF(ASSOCIATED(pot))DEALLOCATE(pot)
+END SUBROUTINE thincurr_td_eval_bpoints
 !---------------------------------------------------------------------------------
 !> Needs docs
 !---------------------------------------------------------------------------------

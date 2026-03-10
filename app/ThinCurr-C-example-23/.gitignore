@@ -1,0 +1,15 @@
+# Build outputs
+build/
+
+# Runtime outputs and caches
+DATA_HOLDR_L.save
+torus_B.bin
+oft_xdmf.*.h5
+pThinCurr_*.rst
+*.hist
+thincurr_*.xmf
+__pycache__/
+
+# Visualization outputs
+figs/
+anime/

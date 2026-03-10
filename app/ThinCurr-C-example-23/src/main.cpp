@@ -14,6 +14,26 @@
 #include <algorithm>
 #include <cmath>
 
+namespace {
+constexpr double kPi = 3.141592653589793238462643383279502884;
+
+// Simple binary format (little-endian, native):
+// magic[8] = "OFTTORUS"
+// int32 version = 1
+// int32 nphi, ntheta, npts, nsaves, save_stride_steps
+// double R0, a, dt
+// double pts_xyz[3*npts]  (x0,y0,z0, x1,y1,z1, ...)
+// For each save i in [0,nsaves):
+//   double time
+//   double B_xyz[3*npts] (Bx0,By0,Bz0, ...)
+void write_i32(std::ofstream& os, int32_t v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+void write_f64(std::ofstream& os, double v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+} // namespace
+
 int main(int argc, char* argv[]) {
     const char* hdf5_file_path = "tokamak_mesh_holes_16.h5";
     const char* xml_file_path = "oft_in.xml";
@@ -129,25 +149,74 @@ int main(int argc, char* argv[]) {
     );
     if (check_error(error_str, "thincurr_td_init")) return -1;
 
-    bool enable_bpoints = true;
-    if (argc > 1 && std::string(argv[1]) == "--bpoints") {
-        enable_bpoints = true;
+    // -------------------------------------------------------------------------
+    // B-field export on a closed torus surface for downstream coupling/BC usage.
+    // Torus definition: major radius R0=1.67m, minor radius a=0.5m.
+    //
+    // IMPORTANT: This uses the dense B-operator cache (Bel_out is nelems*npts*3).
+    // Keep npts modest unless you have sufficient memory.
+    // -------------------------------------------------------------------------
+    const double torus_R0 = 1.67;
+    const double torus_a = 0.5;
+    const int32_t torus_nphi = 72;
+    const int32_t torus_ntheta = 36;
+    const int32_t torus_npts = torus_nphi * torus_ntheta;
+
+    const int32_t save_stride_steps = 10; // must match the plot_freq used in thincurr_td_init/step
+    const int32_t nsaves = (save_stride_steps > 0) ? (nsteps / save_stride_steps + 1) : 1;
+
+    std::vector<double> torus_pts_xyz(3 * torus_npts, 0.0);
+    for (int32_t iphi = 0; iphi < torus_nphi; ++iphi) {
+        const double phi = 2.0 * kPi * static_cast<double>(iphi) / static_cast<double>(torus_nphi);
+        const double cphi = std::cos(phi);
+        const double sphi = std::sin(phi);
+        for (int32_t itheta = 0; itheta < torus_ntheta; ++itheta) {
+            const double theta = 2.0 * kPi * static_cast<double>(itheta) / static_cast<double>(torus_ntheta);
+            const double R = torus_R0 + torus_a * std::cos(theta);
+            const double x = R * cphi;
+            const double y = R * sphi;
+            const double z = torus_a * std::sin(theta);
+            const int32_t idx = iphi * torus_ntheta + itheta;
+            torus_pts_xyz[3 * idx + 0] = x;
+            torus_pts_xyz[3 * idx + 1] = y;
+            torus_pts_xyz[3 * idx + 2] = z;
+        }
     }
-    const int32_t n_bpts = 4;
-    std::vector<double> bpts_xyz;
-    std::vector<double> Bout_xyz;
-    if (enable_bpoints) {
-        bpts_xyz = {
-            2.0,  0.0,  0.0,
-            2.0,  0.5,  0.0,
-            2.0,  0.0,  0.5,
-            2.0, -0.5,  0.0,
-        };
-        Bout_xyz.resize(3 * n_bpts, 0.0);
-        log_info("run `thincurr_td_set_bpoints`");
-        thincurr_td_set_bpoints(tw_obj_ptr, td_state_ptr, n_bpts, bpts_xyz.data(), error_str);
-        if (check_error(error_str, "thincurr_td_set_bpoints")) return -1;
+
+    log_info("run `thincurr_td_set_bpoints` (torus surface)");
+    thincurr_td_set_bpoints(tw_obj_ptr, td_state_ptr, torus_npts, torus_pts_xyz.data(), error_str);
+    if (check_error(error_str, "thincurr_td_set_bpoints")) return -1;
+
+    const std::string torus_bin_file = "torus_B.bin";
+    std::ofstream torus_os(torus_bin_file, std::ios::binary | std::ios::trunc);
+    if (!torus_os) {
+        log_error("Failed to open output file for torus B-field: " + torus_bin_file);
+        return -1;
     }
+    // Header
+    const char magic[8] = {'O', 'F', 'T', 'T', 'O', 'R', 'U', 'S'};
+    torus_os.write(magic, sizeof(magic));
+    write_i32(torus_os, 1); // version
+    write_i32(torus_os, torus_nphi);
+    write_i32(torus_os, torus_ntheta);
+    write_i32(torus_os, torus_npts);
+    write_i32(torus_os, nsaves);
+    write_i32(torus_os, save_stride_steps);
+    write_f64(torus_os, torus_R0);
+    write_f64(torus_os, torus_a);
+    write_f64(torus_os, dt);
+    // Points
+    torus_os.write(reinterpret_cast<const char*>(torus_pts_xyz.data()),
+                   static_cast<std::streamsize>(sizeof(double) * torus_pts_xyz.size()));
+
+    std::vector<double> torus_B_xyz(3 * torus_npts, 0.0);
+    // Save t=0 state
+    log_info("run `thincurr_td_eval_bpoints` (t=0) + write torus_B.bin");
+    thincurr_td_eval_bpoints(tw_obj_ptr, td_state_ptr, torus_npts, torus_B_xyz.data(), error_str);
+    if (check_error(error_str, "thincurr_td_eval_bpoints")) return -1;
+    write_f64(torus_os, 0.0);
+    torus_os.write(reinterpret_cast<const char*>(torus_B_xyz.data()),
+                   static_cast<std::streamsize>(sizeof(double) * torus_B_xyz.size()));
 
     log_info("run `thincurr_td_step` loop");
     std::vector<double> icoil_curr(n_icoils, 0.0);
@@ -172,16 +241,18 @@ int main(int argc, char* argv[]) {
         );
         if (check_error(error_str, "thincurr_td_step")) return -1;
 
-        if (enable_bpoints) {
-            thincurr_td_eval_bpoints(tw_obj_ptr, td_state_ptr, n_bpts, Bout_xyz.data(), error_str);
+        // Save B on the torus at the same stride as restart outputs (every save_stride_steps).
+        if (save_stride_steps > 0 && ((istep + 1) % save_stride_steps == 0)) {
+            thincurr_td_eval_bpoints(tw_obj_ptr, td_state_ptr, torus_npts, torus_B_xyz.data(), error_str);
             if (check_error(error_str, "thincurr_td_eval_bpoints")) return -1;
-            if ((status_freq > 0) && (istep % status_freq == 0)) {
-                log_info("B(p0)=(" + std::to_string(Bout_xyz[0]) + ", " +
-                         std::to_string(Bout_xyz[1]) + ", " +
-                         std::to_string(Bout_xyz[2]) + ")");
-            }
+            write_f64(torus_os, t_out);
+            torus_os.write(reinterpret_cast<const char*>(torus_B_xyz.data()),
+                           static_cast<std::streamsize>(sizeof(double) * torus_B_xyz.size()));
         }
     }
+
+    torus_os.close();
+    log_info("Saved torus B-field samples to: " + torus_bin_file);
 
     log_info("run `thincurr_td_finalize`");
     thincurr_td_finalize(tw_obj_ptr, td_state_ptr, vec_ic.data(), error_str);

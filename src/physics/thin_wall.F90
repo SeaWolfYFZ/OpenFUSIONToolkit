@@ -41,17 +41,31 @@ IMPLICIT NONE
 !---------------------------------------------------------------------------------
 !> Structure containing definition of "hole" elements for multiply connected
 !! surfaces
+!!
+!! In ThinCurr, "holes" are topological constructs used to handle multiply-connected
+!! geometries (e.g., cylinders, tori). When a surface has non-trivial homology,
+!! a single-valued scalar potential cannot represent net current flowing around
+!! topological loops. Hole elements define closed boundary loops where a constant
+!! potential is enforced, allowing the potential to be multivalued across the cut
+!! defined by the hole. This enables representation of poloidal and toroidal currents
+!! in toroidal geometries.
+!!
+!! @note The number of holes required equals the first Betti number (genus) of the
+!!       surface. For a cylinder: 1 hole (azimuthal current). For a torus: 2 holes
+!!       (poloidal and toroidal currents).
+!!
+!! @see doc_tw_main_holes for detailed physical explanation
 !---------------------------------------------------------------------------------
 TYPE :: hole_mesh
-  INTEGER(i4) :: i0 = 0 !< Starting point for point chain
-  INTEGER(i4) :: n = 0 !< Number of points in chain
-  INTEGER(i4), POINTER, DIMENSION(:) :: lp => NULL() !< List of points in chain
-  INTEGER(i4), POINTER, DIMENSION(:) :: lp_sorted => NULL() !< Sorted list of points in chain
-  INTEGER(i4), POINTER, DIMENSION(:) :: sort_ind => NULL() !< Index from sorted list
-  INTEGER(i4), POINTER, DIMENSION(:) :: kpc => NULL() !< Pointer to point-cell linkage
-  INTEGER(i4), POINTER, DIMENSION(:) :: lpc => NULL() !< List of cells tied to each point
+  INTEGER(i4) :: i0 = 0 !< Starting point for point chain (boundary vertex)
+  INTEGER(i4) :: n = 0 !< Number of points in the hole boundary chain
+  INTEGER(i4), POINTER, DIMENSION(:) :: lp => NULL() !< Ordered list of mesh vertices forming the hole boundary
+  INTEGER(i4), POINTER, DIMENSION(:) :: lp_sorted => NULL() !< Sorted list of points (for duplicate detection)
+  INTEGER(i4), POINTER, DIMENSION(:) :: sort_ind => NULL() !< Index mapping from sorted to original order
+  INTEGER(i4), POINTER, DIMENSION(:) :: kpc => NULL() !< Pointer array for point-to-cell connectivity along hole
+  INTEGER(i4), POINTER, DIMENSION(:) :: lpc => NULL() !< List of cells adjacent to each point on the hole boundary
   ! REAL(r8), POINTER, DIMENSION(:) :: fsign => NULL() !< Sign of 
-  REAL(r8) :: ptcc(3) = 0.d0
+  REAL(r8) :: ptcc(3) = 0.d0  !< Geometric center (centroid) of the hole loop [x,y,z]
 END TYPE hole_mesh
 !---------------------------------------------------------------------------------
 !> Structure containing definition of a flux loop sensor
@@ -64,12 +78,21 @@ TYPE :: floop_sensor
 END TYPE floop_sensor
 !---------------------------------------------------------------------------------
 !> Structure containing definition of a current jumper sensor
+!!
+!! Current jumpers are diagnostic elements that measure net current flowing
+!! between points on the mesh surface. They integrate the potential difference
+!! along a path, including contributions from hole elements when the path
+!! crosses topological cuts.
+!!
+!! The measured current is computed as:
+!! \f[ I = \frac{1}{\mu_0} \left( \sum_{k} (\phi_{k+1} - \phi_k) + \sum_{h} f_h \phi_h \right) \f]
+!! where \f$ \phi_h \f$ are hole potentials and \f$ f_h \f$ are coupling factors.
 !---------------------------------------------------------------------------------
 TYPE :: jumper_sensor
-  INTEGER(i4) :: np = 0 !< Number of points on jumper
-  CHARACTER(LEN=40) :: name = '' !< Name of sensor
-  INTEGER(i4), POINTER, DIMENSION(:) :: points => NULL() !< List of points on jumper
-  REAL(r8), POINTER, DIMENSION(:) :: hole_facs => NULL() !< Coupling weight to "holes"
+  INTEGER(i4) :: np = 0 !< Number of points defining the jumper path
+  CHARACTER(LEN=40) :: name = '' !< Descriptive name for the sensor
+  INTEGER(i4), POINTER, DIMENSION(:) :: points => NULL() !< Ordered list of mesh vertex indices along the jumper path
+  REAL(r8), POINTER, DIMENSION(:) :: hole_facs => NULL() !< Coupling coefficients to each hole element [nholes]
 END TYPE jumper_sensor
 !---------------------------------------------------------------------------------
 !> Structure containing sensor sets
@@ -104,46 +127,64 @@ TYPE :: tw_coil_set
 END TYPE tw_coil_set
 !---------------------------------------------------------------------------------
 !> Class for thin-wall simulation
+!!
+!! Main data structure for ThinCurr electromagnetic models. Contains all mesh,
+!! topology, and matrix data required for time-domain, frequency-domain, and
+!! eigenvalue simulations.
+!!
+!! Topological Structure:
+!! - The total number of degrees of freedom is: nelems = np_active + nholes + n_vcoils
+!! - np_active: Active potential nodes (interior + boundary, excluding closures)
+!! - nholes: Topological hole elements for multiply-connected geometries
+!! - n_vcoils: Voltage-specified filament coils (passive conductors)
+!!
+!! Gauge Fixing:
+!! - For closed manifolds (e.g., complete torus), closure elements fix the potential
+!!   gauge at selected vertices to ensure matrix invertibility.
+!! - The number of closures equals the number of enclosed volumes (typically 1).
+!!
+!! @see doc_tw_main_holes for hole element theory
+!! @see doc_tw_main_close for closure element theory
 !---------------------------------------------------------------------------------
 TYPE :: tw_type
-  INTEGER(i4) :: nelems = 0 !< Number of elements in model (np_active+nholes+n_vcoils)
-  INTEGER(i4) :: np_active = 0 !< Number of active vertices in model
-  INTEGER(i4) :: n_vcoils = 0 !< Number of voltage-specified coils in model
-  INTEGER(i4) :: n_icoils = 0 !< Number of current-specified coils in model
-  INTEGER(i4) :: nholes = 0 !< Number of "holes" in model
-  INTEGER(i4) :: nclosures = 0 !< Number of "closures" in model
-  INTEGER(i4) :: nfh = 0 !< Number of face-hole interactions
-  LOGICAL, POINTER, DIMENSION(:) :: sens_mask => NULL() !< Mask array for sensors [nreg]
-  INTEGER(i4), POINTER, DIMENSION(:) :: pmap => NULL() !< Map from mesh vertices to active vertices [mesh%np]
-  INTEGER(i4), POINTER, DIMENSION(:) :: kpmap_inv => NULL() !< Map from active vertices to mesh vertices [np_active]
-  INTEGER(i4), POINTER, DIMENSION(:) :: lpmap_inv => NULL() !< Map from active vertices to mesh vertices [mesh%np]
-  INTEGER(i4), POINTER, DIMENSION(:) :: closures => NULL() !< List of closure vertices [nclosures]
-  INTEGER(i4), POINTER, DIMENSION(:) :: kfh => NULL() !< Pointer to face-hole interaction list [mesh%nc+1]
-  INTEGER(i4), POINTER, DIMENSION(:,:) :: lfh => NULL() !< List of face-hole interactions [nfh]
-  REAL(r8), POINTER, DIMENSION(:) :: Eta_reg => NULL() !< Resistivity*thickness values for each region [nreg]
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2dr => NULL() !< Element to driver (icoils) coupling matrix
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2coil => NULL() !< Element to coil (vcoils+icoils) coupling matrix
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2sen => NULL() !< Element to sensor coupling matrix
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Acoil2coil => NULL() !< Coil to coil coupling matrix
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Lmat => NULL() !< Full inductance matrix
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Adr2sen => NULL() !< Driver (icoils) to sensor coupling matrix
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: Bel => NULL()
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: Bdr => NULL()
-  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: qbasis => NULL() !< Basis function pre-evaluated at cell centers
-  TYPE(xdmf_plot_file) :: xdmf
-  CLASS(oft_vector), POINTER :: Uloc => NULL() !< FE vector for thin-wall model
-  CLASS(oft_vector), POINTER :: Uloc_pts => NULL() !< Needs docs
-  TYPE(oft_native_matrix), POINTER :: Rmat => NULL() !< Resistivity matrix for thin-wall model
-  CLASS(oft_bmesh), POINTER :: mesh => NULL() !< Underlying surface mesh
-  TYPE(hole_mesh), POINTER, DIMENSION(:) :: hmesh => NULL() !< Hole definitions
-  TYPE(oft_1d_int), POINTER, DIMENSION(:) :: jumper_nsets => NULL() !< Jumper definitions
-  TYPE(tw_coil_set), POINTER, DIMENSION(:) :: vcoils => NULL() !< List of Vcoils
-  TYPE(tw_coil_set), POINTER, DIMENSION(:) :: icoils => NULL() !< List of Icoils
-  TYPE(xml_node), POINTER :: xml => NULL()
+  INTEGER(i4) :: nelems = 0 !< Total DOFs in model: np_active + nholes + n_vcoils
+  INTEGER(i4) :: np_active = 0 !< Number of active scalar potential nodes (excludes holes, closures, and vcoils)
+  INTEGER(i4) :: n_vcoils = 0 !< Number of voltage-specified passive filament coils
+  INTEGER(i4) :: n_icoils = 0 !< Number of current-specified active filament coils (drivers)
+  INTEGER(i4) :: nholes = 0 !< Number of topological "hole" elements for multiply-connected surfaces
+  INTEGER(i4) :: nclosures = 0 !< Number of "closure" elements for gauge fixing on closed manifolds
+  INTEGER(i4) :: nfh = 0 !< Total number of face-hole coupling entries (connectivity between triangles and holes)
+  LOGICAL, POINTER, DIMENSION(:) :: sens_mask => NULL() !< Sensor masking array for regions [nreg]
+  INTEGER(i4), POINTER, DIMENSION(:) :: pmap => NULL() !< Mapping from mesh vertices to active DOF indices [mesh%np]
+  INTEGER(i4), POINTER, DIMENSION(:) :: kpmap_inv => NULL() !< Inverse mapping: CSR-style pointer array for active vertices [np_active+1]
+  INTEGER(i4), POINTER, DIMENSION(:) :: lpmap_inv => NULL() !< Inverse mapping: list of mesh vertex indices for each active DOF [mesh%np]
+  INTEGER(i4), POINTER, DIMENSION(:) :: closures => NULL() !< List of mesh vertex indices used as closure points (gauge fix) [nclosures]
+  INTEGER(i4), POINTER, DIMENSION(:) :: kfh => NULL() !< CSR pointer array for face-hole connectivity [mesh%nc+1]
+  INTEGER(i4), POINTER, DIMENSION(:,:) :: lfh => NULL() !< Face-hole connectivity list: [2, nfh] - (hole_id, local_edge_index)
+  REAL(r8), POINTER, DIMENSION(:) :: Eta_reg => NULL() !< Surface resistivity (eta*thickness) for each mesh region [nreg]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2dr => NULL() !< Element-to-driver (icoils) mutual inductance matrix [nelems, n_icoils]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2coil => NULL() !< Element-to-coil (vcoils+icoils) mutual inductance [nelems, nholes+n_vcoils+n_icoils]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2sen => NULL() !< Element-to-sensor (flux loops) coupling matrix [nfloops, nelems]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Acoil2coil => NULL() !< Coil-to-coil self/mutual inductance matrix [ncoils, ncoils]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Lmat => NULL() !< Full dense inductance matrix [np_active, np_active] (for non-HODLR)
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Adr2sen => NULL() !< Driver coils (icoils) to sensor mutual inductance [nfloops, n_icoils]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: Bel => NULL()  !< B-field reconstruction operator for mesh elements [np, nelems, 3]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: Bdr => NULL()  !< B-field reconstruction operator for driver coils [np, n_icoils, 3]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: qbasis => NULL() !< Pre-computed basis vectors at cell centers: (grad phi_i × n) [3, 3, ncells]
+  TYPE(xdmf_plot_file) :: xdmf  !< XDMF file handle for visualization output
+  CLASS(oft_vector), POINTER :: Uloc => NULL() !< FE vector space for thin-wall DOFs (size: nelems)
+  CLASS(oft_vector), POINTER :: Uloc_pts => NULL() !< FE vector space for mesh vertices (size: mesh%np)
+  TYPE(oft_native_matrix), POINTER :: Rmat => NULL() !< Sparse resistivity matrix in CSR format
+  CLASS(oft_bmesh), POINTER :: mesh => NULL() !< Underlying unstructured triangular surface mesh
+  TYPE(hole_mesh), POINTER, DIMENSION(:) :: hmesh => NULL() !< Array of hole mesh definitions [nholes]
+  TYPE(oft_1d_int), POINTER, DIMENSION(:) :: jumper_nsets => NULL() !< Legacy jumper nodeset definitions
+  TYPE(tw_coil_set), POINTER, DIMENSION(:) :: vcoils => NULL() !< List of voltage-specified coil sets
+  TYPE(tw_coil_set), POINTER, DIMENSION(:) :: icoils => NULL() !< List of current-specified coil sets (external drivers)
+  TYPE(xml_node), POINTER :: xml => NULL()  !< XML configuration node for this model
 CONTAINS
-  !> Setup thin-wall model
+  !> Setup thin-wall model from mesh and XML configuration
   PROCEDURE :: setup => tw_setup
-  !> Save debug information for model
+  !> Save debug information for model diagnostics
   PROCEDURE :: save_debug => tw_save_debug
 END TYPE tw_type
 
@@ -178,11 +219,39 @@ integer(i4), public, parameter :: tw_idx_ver=1 !< File version for array indexin
 character(LEN=16), public, parameter :: tw_idx_path="ThinCurr_Version" !< HDF5 field name
 CONTAINS
 !---------------------------------------------------------------------------------
-!> Needs Docs
+!> Setup thin-wall model from mesh and configuration
+!!
+!! This subroutine initializes all topological structures for the ThinCurr model:
+!! 1. Loads coil definitions (vcoils and icoils) from XML input
+!! 2. Constructs hole elements from provided nodesets (or computes automatically)
+!! 3. Builds face-hole connectivity (lfh/kfh arrays)
+!! 4. Handles closure elements for gauge fixing on closed manifolds
+!! 5. Creates DOF mapping (pmap) excluding boundary vertices and closures
+!! 6. Pre-computes basis function evaluations (qbasis)
+!!
+!! Topological Processing:
+!! - Hole elements enable representation of net currents around topological loops
+!! - Closure elements fix the potential gauge by removing DOFs at selected vertices
+!! - The mapping pmap converts mesh vertex indices to active DOF indices:
+!!   * pmap(i) = 0 for boundary vertices (unless part of a hole)
+!!   * pmap(i) > 0 for active interior/boundary vertices
+!!   * pmap(i) < 0 temporarily marks closure vertices during setup
+!!
+!! @param[in,out] self      Thin-wall model object
+!! @param[in]     hole_ns   Array of nodesets defining hole boundary vertices
+!!
+!! @post self%hmesh populated with hole definitions
+!! @post self%kfh and self%lfh contain face-hole connectivity
+!! @post self%pmap contains DOF mapping
+!! @post self%nelems = np_active + nholes + n_vcoils
+!!
+!! @see get_hole_pseq Internal subroutine to trace boundary hole chains
+!! @see order_hole_list Internal subroutine to reorder hole vertices
+!! @see tw_setup_hole External subroutine to build hole mesh connectivity
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_setup(self,hole_ns)
 CLASS(tw_type), INTENT(INOUT) :: self !< Thin-wall model object
-TYPE(oft_1d_int), POINTER, INTENT(IN) :: hole_ns(:) !< Hole nodesets
+TYPE(oft_1d_int), POINTER, INTENT(IN) :: hole_ns(:) !< Hole nodesets (vertex lists for each hole)
 INTEGER(4) :: i,j,k,l,face,ioffset,ed,error_flag
 INTEGER(4), ALLOCATABLE :: kfh_tmp(:),np_inverse(:)
 REAL(8) :: f(3),rgop(3,3),area_i,norm_i(3)
@@ -226,6 +295,23 @@ DO i=1,self%n_icoils
 END DO
 #endif
 !---Analyze mesh to construct holes
+!!
+!! This section processes hole definitions provided by the user (typically generated
+!! by ThinCurr_compute_holes.py script using greedy homology algorithm).
+!!
+!! For each hole:
+!! 1. If nodeset has 1 point: treat as periodic boundary, trace full loop automatically
+!! 2. If nodeset has >1 points: use provided vertices as hole boundary
+!! 3. Build hole mesh structure (hmesh) with connectivity to adjacent cells
+!! 4. Construct face-hole coupling arrays (kfh/lfh) for matrix assembly
+!!
+!! The face-hole connectivity (lfh) stores for each triangle edge that borders a hole:
+!! - lfh(1,ii): Signed hole index (sign indicates orientation)
+!! - lfh(2,ii): Local edge index (1,2,3) on the triangle
+!!
+!! This connectivity is used during L-matrix assembly to couple hole DOFs to
+!! adjacent triangle DOFs, enabling current flow around topological loops.
+!!
 WRITE(*,'(2A)')oft_indent,'Building holes'
 ALLOCATE(self%hmesh(self%nholes))
 ALLOCATE(self%kfh(self%mesh%nc+1))
@@ -236,6 +322,7 @@ IF(self%nholes>0)THEN
       WRITE(*,'(2A,I12)')oft_indent,'  Hole: ',i
       WRITE(*,'(2A,I12)')oft_indent,'    Nset size = ',hole_ns(i)%n
     END IF
+    ! Handle single-point nodeset (periodic boundary) vs multi-point explicit definition
     IF(hole_ns(i)%n==1)THEN
       self%hmesh(i)%i0 = hole_ns(i)%v(1)
       CALL get_hole_pseq(self%hmesh(i)%i0, self%hmesh(i)%lp, self%hmesh(i)%n)
@@ -310,11 +397,21 @@ IF(.NOT.ASSOCIATED(self%pmap))THEN
     self%pmap(i)=self%np_active
   END DO
   ! Convert closure cells to vertices and mark
+  !!
+  !! Closures are used to fix the gauge on closed manifolds (surfaces without boundaries).
+  !! Without gauge fixing, the inductance matrix L would be singular due to the
+  !! freedom to add a constant to the scalar potential everywhere.
+  !!
+  !! For each closure cell (triangle), we select the vertex with the most adjacent
+  !! cells and mark it as a closure point (pmap = 0). This effectively removes
+  !! that DOF from the system, fixing the potential reference.
+  !!
   DO i=1,self%nclosures
     l=-1
     j=1
     DO k=1,3
       IF(self%pmap(self%mesh%lc(k,self%closures(i)))<=0)CYCLE
+      ! Select vertex with maximum connectivity (most robust numerically)
       IF(self%mesh%kpc(self%mesh%lc(k,self%closures(i))+1)-self%mesh%kpc(self%mesh%lc(k,self%closures(i)))>l)THEN
         l=self%mesh%kpc(self%mesh%lc(k,self%closures(i))+1)-self%mesh%kpc(self%mesh%lc(k,self%closures(i)))
         j=k
@@ -322,18 +419,22 @@ IF(.NOT.ASSOCIATED(self%pmap))THEN
     END DO
     j=self%mesh%lc(j,self%closures(i))
     IF(self%pmap(j)==0)CALL oft_abort("Error getting closure vertex","tw_setup",__FILE__)
-    self%pmap(j)=-i
+    self%pmap(j)=-i  ! Temporarily mark as negative to identify as closure
     self%closures(i)=j
   END DO
   self%nclosures=0 !-self%nclosures
-  ! Reindex, removing closure vertices
+  ! Reindex, removing closure vertices from active DOF count
+  !!
+  !! After marking closures, renumber active DOFs to exclude them.
+  !! Closure vertices will have pmap(i) = 0 (excluded from system).
+  !!
   self%np_active=0
   DO i=1,self%mesh%np
     IF(self%pmap(i)>0)THEN
       self%np_active=self%np_active+1
       self%pmap(i)=self%np_active
     ELSE
-      self%pmap(i)=0
+      self%pmap(i)=0  ! Boundary or closure vertex
     END IF
   END DO
 ELSE
@@ -422,6 +523,22 @@ CALL oft_decrease_indent
 CONTAINS
 !---------------------------------------------------------------------------------
 !> Find connected chain for a boundary hole from a starting vertex
+!!
+!! This subroutine traces a closed loop along boundary edges starting from a
+!! given vertex. Used for holes defined by a single point (periodic boundaries).
+!!
+!! The algorithm walks along boundary edges, always taking the next boundary
+!! edge that doesn't backtrack, until returning to the starting vertex.
+!!
+!! @param[in]  i0        Starting vertex index (must lie on mesh boundary)
+!! @param[out] plist     Output: ordered list of vertices forming the closed loop
+!! @param[out] n         Number of vertices in the loop
+!!
+!! @pre i0 must be a boundary vertex (self%mesh%bp(i0) = .TRUE.)
+!! @pre The boundary must form a closed loop (manifold requirement)
+!!
+!! @note This handles the case where a hole nodeset contains only 1 vertex,
+!!       indicating a periodic boundary that should be traced automatically.
 !---------------------------------------------------------------------------------
 SUBROUTINE get_hole_pseq(i0,plist,n)
 INTEGER(4), INTENT(in) :: i0 !< Starting vertex (must be on boundary)
@@ -461,11 +578,26 @@ DEALLOCATE(lloop_tmp)
 END SUBROUTINE get_hole_pseq
 !---------------------------------------------------------------------------------
 !> Reorder hole vertices into a sequential chain
+!!
+!! When a hole is defined by multiple vertices (nodeset with n>1 points), the
+!! vertices may not be in order along the boundary. This subroutine reorders
+!! them to form a continuous path along mesh edges.
+!!
+!! The algorithm starts from the first vertex and walks along boundary edges,
+!! selecting the next unvisited vertex from the input list at each step.
+!!
+!! @param[in]  n         Number of points in the hole
+!! @param[in]  list_in   Input: unordered list of vertex indices
+!! @param[out] list_out  Output: reordered list forming continuous chain
+!!
+!! @note The input list must form a topologically valid loop (all vertices
+!!       must be connected by boundary edges).
+!! @note For periodic boundaries with n=1, use get_hole_pseq instead.
 !---------------------------------------------------------------------------------
 SUBROUTINE order_hole_list(list_in,list_out,n)
 INTEGER(4), INTENT(in) :: n !< Number of points in list
-INTEGER(4), INTENT(in) :: list_in(n) !< Input vertex list
-INTEGER(4), INTENT(out) :: list_out(n) !< Reordered list
+INTEGER(4), INTENT(in) :: list_in(n) !< Input vertex list (unordered)
+INTEGER(4), INTENT(out) :: list_out(n) !< Reordered list (continuous chain)
 INTEGER(4) :: ii,jj,k,l,nlinks,ipt,eprev,ed,ed2,ptp2,ptp,candidate,candidate2,last_item(3),i0
 INTEGER(4), ALLOCATABLE :: lloop_tmp(:),flag_list(:)
 !---Find loop points and edges

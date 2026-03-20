@@ -620,7 +620,56 @@ oft_env%pm=pm
 END SUBROUTINE gmres_comp
 END SUBROUTINE frequency_response
 !---------------------------------------------------------------------------------
-!> Needs Docs
+!> Run time-domain simulation for ThinCurr model
+!!
+!! Solves the time-dependent inductive-resistive equation:
+!! \f[ \mathrm{L} \frac{\partial I}{\partial t} + \mathrm{R} I = V(t) \f]
+!!
+!! using either Backward Euler or Crank-Nicolson time integration.
+!!
+!! Time Integration Schemes:
+!! - Backward Euler (use_cn=.FALSE.):
+!!   \f[ (\mathrm{L} + \Delta t \mathrm{R}) I^{n+1} = \mathrm{L} I^n + \Delta t V^{n+1} \f]
+!!   First-order accurate, unconditionally stable
+!!
+!! - Crank-Nicolson (use_cn=.TRUE.):
+!!   \f[ (\mathrm{L} + \frac{\Delta t}{2} \mathrm{R}) I^{n+1} = (\mathrm{L} - \frac{\Delta t}{2} \mathrm{R}) I^n + \frac{\Delta t}{2}(V^{n+1} + V^n) \f]
+!!   Second-order accurate, unconditionally stable
+!!
+!! Topological DOF Handling:
+!! The solution vector includes all DOFs in order:
+!! 1. Active mesh vertices: vec(1:np_active)
+!! 2. Hole elements: vec(np_active+1:np_active+nholes)
+!! 3. V-coils: vec(np_active+nholes+1:nelems)
+!!
+!! Hole DOFs represent constant potentials on topological loops, enabling
+!! net current flow around multiply-connected geometries. During time advance,
+!! hole DOFs evolve according to mutual coupling with mesh elements and coils.
+!!
+!! @param[in] self         ThinCurr model object
+!! @param[in] dt           Time step size [s]
+!! @param[in] nsteps       Number of time steps
+!! @param[inout] vec       Initial/final solution vector [nelems]
+!! @param[in] direct       Use direct solver (.TRUE.) or iterative (.FALSE.)
+!! @param[in] lin_tols     Linear solver tolerances [atol, rtol]
+!! @param[in] use_cn       Use Crank-Nicolson scheme (.TRUE.) or Backward Euler (.FALSE.)
+!! @param[in] nstatus      Output frequency for status messages
+!! @param[in] nplot        Output frequency for restart files
+!! @param[in] sensors      Sensor definitions (flux loops, jumpers)
+!! @param[in] curr_waveform Prescribed current waveform for I-coils [ntimes, n_icoils+1]
+!! @param[in] volt_waveform Prescribed voltage waveform for V-coils [ntimes, n_vcoils+1]
+!! @param[out] sensor_vals Output sensor signals [nsteps+1, nfloops+njumpers+1]
+!! @param[inout] hodlr_op  HODLR compressed L matrix (optional, for large systems)
+!!
+!! @note For systems with holes, the solution vector length is:
+!!       nelems = np_active + nholes + n_vcoils
+!!
+!! @note Sensor output includes:
+!!       - Flux loops: mutual inductance with mesh elements + I-coils
+!!       - Jumpers: potential differences along paths + hole contributions
+!!
+!! @see doc_tw_main for theoretical background
+!! @see thin_wall_hodlr.F90 for HODLR matrix operations
 !---------------------------------------------------------------------------------
 SUBROUTINE run_td_sim(self,dt,nsteps,vec,direct,lin_tols,use_cn,nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_vals,hodlr_op)
 TYPE(tw_type), INTENT(in) :: self
@@ -780,12 +829,15 @@ CALL hdf5_write(icoil_curr,'pThinCurr_'//pltnum//'.rst','coil_currents')
 !---Save sensor data for t=0
 CALL u%get_local(vals)
 IF(sensors%nfloops>0)THEN
+  !---Flux loop sensors: compute mutual inductance signal
   WRITE(fmt_str,'(I6)')sensors%nfloops+1
   fmt_str='('//TRIM(fmt_str)//'E24.15)'
   ALLOCATE(senout(sensors%nfloops+1))
   senout=0.d0
+  ! Add I-coil contribution to flux loops
   IF(ntimes_curr>0)CALL dgemv('N',sensors%nfloops,self%n_icoils,1.d0,self%Adr2sen, &
     sensors%nfloops,icoil_curr,1,0.d0,senout(2),1)
+  ! Interpolate V-coil voltage contribution if needed
   IF((ntimes_volt>0).AND.ASSOCIATED(sensor_vals))THEN
     CALL linterp_facs(sensor_vals(:,1),ntimes_volt,t,int_inds,int_facs,1)
     DO i=1,sensors%nfloops
@@ -807,11 +859,29 @@ IF(sensors%nfloops>0)THEN
     CALL floop_hist%write(data_r8=senout)
   END IF
 END IF
+!
+!---Current jumper sensors: measure net current along paths
+!!
+!! Jumper signals include contributions from:
+!! 1. Potential differences along the path through mesh vertices
+!! 2. Hole element potentials (when path crosses topological cuts)
+!! 3. V-coil currents (for passive conductors)
+!!
+!! Formula:
+!! \f[ I_{\text{jumper}} = \frac{1}{\mu_0} \left( \sum_{k} (\phi_{k+1} - \phi_k) + \sum_{h} f_h \phi_h + \sum_{v} I_v \right) \f]
+!!
+!! where:
+!! - \f$ \phi_k \f$: scalar potential at mesh vertex k
+!! - \f$ \phi_h \f$: hole potential for hole h
+!! - \f$ f_h \f$: topological coupling coefficient (hole_facs)
+!! - \f$ I_v \f$: V-coil current
+!!
 IF(sensors%njumpers+self%nholes+self%n_vcoils>0)THEN
   ALLOCATE(jumpout(sensors%njumpers+self%nholes+self%n_vcoils+1))
   DO j=1,sensors%njumpers
     tmp=0.d0
     val_prev=0.d0
+    ! Integrate potential along jumper path
     ind1=self%pmap(sensors%jumpers(j)%points(1))
     IF(ind1>0)val_prev=vals(ind1)
     DO k=1,sensors%jumpers(j)%np-1
@@ -824,11 +894,13 @@ IF(sensors%njumpers+self%nholes+self%n_vcoils>0)THEN
         val_prev=0.d0
       END IF
     END DO
+    ! Add hole contributions (critical for multiply-connected geometries)
     DO k=1,self%nholes
       tmp=tmp+vals(self%np_active+k)*sensors%jumpers(j)%hole_facs(k)
     END DO
     jumpout(j+1)=tmp/mu0
   END DO
+  ! Add hole and V-coil DOFs directly
   DO j=1,self%nholes+self%n_vcoils
     jumpout(sensors%njumpers+j+1)=vals(self%np_active+j)/mu0
   END DO

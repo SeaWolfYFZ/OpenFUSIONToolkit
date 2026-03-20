@@ -620,7 +620,42 @@ oft_env%pm=pm
 END SUBROUTINE gmres_comp
 END SUBROUTINE frequency_response
 !---------------------------------------------------------------------------------
-!> Needs Docs
+!> Run time-domain simulation using implicit time stepping
+!!
+!! @details This subroutine advances the thin-wall model in time using either
+!! Backward Euler (use_cn=.FALSE.) or Crank-Nicolson (use_cn=.TRUE.) schemes.
+!!
+!! **Solution Vector Layout:**
+!! The solution vector `vec` has dimensions (nelems) where:
+!!   - vec(1:np_active): Scalar potential values at active mesh vertices
+!!   - vec(np_active+1:np_active+nholes): Hole currents (flux through holes)
+!!   - vec(np_active+nholes+1:nelems): Vcoil currents
+!!
+!! **Hole Current Handling:**
+!! Hole currents represent net current flowing around topologically non-trivial
+!! loops. They are computed from the potential difference across boundaries and
+!! stored in the solution vector at indices (np_active + hole_index).
+!!
+!! **Time Stepping Equation (Backward Euler):**
+!! \f[ [L + dt \cdot R] I^{n+1} = L \cdot I^n + dt \cdot V^{n+1} \f]
+!!
+!! **Crank-Nicolson:**
+!! \f[ [L + \frac{dt}{2}R] I^{n+1} = [L - \frac{dt}{2}R] I^n + \frac{dt}{2}(V^{n+1} + V^n) \f]
+!!
+!! @param[in] self ThinCurr model object
+!! @param[in] dt Time step size
+!! @param[in] nsteps Number of time steps to advance
+!! @param[inout] vec Initial/final solution vector
+!! @param[in] direct Use direct solver (.TRUE.) or iterative CG (.FALSE.)
+!! @param[in] lin_tols Solver tolerances [absolute, relative]
+!! @param[in] use_cn Use Crank-Nicolson (.TRUE.) or Backward Euler (.FALSE.)
+!! @param[in] nstatus Status print frequency
+!! @param[in] nplot Plot file output frequency
+!! @param[in] sensors Sensor definitions
+!! @param[in] curr_waveform Icoil current waveforms
+!! @param[in] volt_waveform Vcoil voltage waveforms
+!! @param[out] sensor_vals Sensor output values
+!! @param[inout] hodlr_op Optional HODLR operator for large models
 !---------------------------------------------------------------------------------
 SUBROUTINE run_td_sim(self,dt,nsteps,vec,direct,lin_tols,use_cn,nstatus,nplot,sensors,curr_waveform,volt_waveform,sensor_vals,hodlr_op)
 TYPE(tw_type), INTENT(in) :: self
@@ -809,6 +844,9 @@ IF(sensors%nfloops>0)THEN
 END IF
 IF(sensors%njumpers+self%nholes+self%n_vcoils>0)THEN
   ALLOCATE(jumpout(sensors%njumpers+self%nholes+self%n_vcoils+1))
+  !---Compute jumper sensor currents
+  ! Jumper sensors measure current flowing through a specified path of vertices.
+  ! The current is computed as the sum of potential differences along the path.
   DO j=1,sensors%njumpers
     tmp=0.d0
     val_prev=0.d0
@@ -824,11 +862,16 @@ IF(sensors%njumpers+self%nholes+self%n_vcoils>0)THEN
         val_prev=0.d0
       END IF
     END DO
+    !---Add hole contributions to jumper current
+    ! Hole currents (stored at vals(np_active+k)) contribute to the total
+    ! current through the jumper with weights defined by hole_facs.
     DO k=1,self%nholes
       tmp=tmp+vals(self%np_active+k)*sensors%jumpers(j)%hole_facs(k)
     END DO
     jumpout(j+1)=tmp/mu0
   END DO
+  !---Store hole currents and Vcoil currents in output
+  ! These are stored after jumper sensor values in the output array.
   DO j=1,self%nholes+self%n_vcoils
     jumpout(sensors%njumpers+j+1)=vals(self%np_active+j)/mu0
   END DO

@@ -3,11 +3,31 @@
 !
 ! SPDX-License-Identifier: LGPL-3.0-only
 !---------------------------------------------------------------------------------
-!> @file thin_wall_hodlr.F90
-!
 !> Hierarchical Off-Diagonal Low Rank matrix approximation functionality for ThinCurr
-!!  - SVD compression
-!!  - Adaptive Cross Approximation
+!!
+!! @details This module provides HODLR (Hierarchical Off-Diagonal Low-Rank) matrix
+!! approximation for the dense inductance matrix L, reducing memory and computational
+!! complexity from O(N^2) to O(N log N) for large models.
+!!
+!! **Key Concepts:**
+!! 1. **Spatial Partitioning**: The mesh is recursively subdivided using a binary tree,
+!!    creating a hierarchical block structure.
+!! 2. **Block Classification**: Matrix blocks are classified as:
+!!    - Near-field (diagonal): Stored as dense matrices
+!!    - Far-field (off-diagonal): Compressed using low-rank approximation
+!! 3. **Compression Methods**:
+!!    - SVD: Used for near-field off-diagonal blocks
+!!    - ACA+ (Adaptive Cross Approximation): Used for far-field blocks
+!!
+!! **Matrix Representation:**
+!! The L matrix is approximated as:
+!! \f[ L \approx L_{diag} + \sum_{k} U_k V_k^T \f]
+!! where diagonal blocks are dense and off-diagonal blocks are stored in UV form.
+!!
+!! **Applications in ThinCurr:**
+!! - L matrix assembly with HODLR compression
+!! - B-field operator compression for magnetic field reconstruction
+!! - Block-Jacobi preconditioners for iterative solvers
 !!
 !! @authors Chris Hansen
 !! @date Feb 2024
@@ -18,59 +38,104 @@ USE thin_wall
 IMPLICIT NONE
 #include "local.h"
 !---------------------------------------------------------------------------------
-!> Needs docs
+!> Block structure for HODLR spatial partitioning
+!!
+!! @details Represents a spatial region in the hierarchical binary tree partition.
+!! Each block contains a subset of mesh elements and vertices, with associated
+!! geometric information for distance-based interaction classification.
+!!
+!! **Key Fields:**
+!! - nelems: Number of finite element DOFs in the block
+!! - center: Geometric center for distance calculations
+!! - extent: Characteristic size (circumradius) for near/far classification
+!! - ielem: List of element indices belonging to this block
+!! - inv_map: Inverse mapping from global to local indices
 !---------------------------------------------------------------------------------
 type :: oft_tw_block
-  INTEGER(4) :: np = 0
-  INTEGER(4) :: nelems = 0
-  INTEGER(4) :: ncells = 0
-  INTEGER(4) :: parent = -1
-  REAL(8) :: center(3) = 0.d0
-  REAL(8) :: extent = 0.d0
-  INTEGER(4), POINTER :: ielem(:) => NULL()
-  INTEGER(4), POINTER :: inv_map(:) => NULL()
-  INTEGER(4), POINTER :: ipts(:) => NULL()
-  INTEGER(4), POINTER :: icell(:) => NULL()
+  INTEGER(4) :: np = 0 !< Number of vertices in block
+  INTEGER(4) :: nelems = 0 !< Number of finite element DOFs in block
+  INTEGER(4) :: ncells = 0 !< Number of mesh cells touching vertices in block
+  INTEGER(4) :: parent = -1 !< Index of parent block in hierarchy (-1 for root)
+  REAL(8) :: center(3) = 0.d0 !< Geometric center of block
+  REAL(8) :: extent = 0.d0 !< Characteristic size (circumradius) of block
+  INTEGER(4), POINTER :: ielem(:) => NULL() !< List of element indices in this block
+  INTEGER(4), POINTER :: inv_map(:) => NULL() !< Inverse map: global vertex to local index
+  INTEGER(4), POINTER :: ipts(:) => NULL() !< List of vertex indices in this block
+  INTEGER(4), POINTER :: icell(:) => NULL() !< List of cell indices touching vertices
 end type oft_tw_block
 !---------------------------------------------------------------------------------
-!> Needs docs
+!> Level structure in the HODLR binary tree
+!!
+!! @details Represents one level in the hierarchical binary tree partition.
+!! The tree starts at level 1 with the full mesh and recursively subdivides
+!! until blocks reach the target size (leaf_target).
+!!
+!! **Matrix Mask (mat_mask):**
+!! The mat_mask array encodes the type of block-block interactions:
+!! - 0: No interaction (masked by parent level)
+!! - 1: Diagonal block (dense storage)
+!! - 2: Far-field off-diagonal (ACA compression allowed)
+!! - 3: Near-field off-diagonal (SVD compression only)
+!! - Negative values indicate transpose relationships
 !---------------------------------------------------------------------------------
 type oft_tw_level
-  INTEGER(4) :: nblocks = 0
-  INTEGER(4), POINTER, DIMENSION(:,:) :: mat_mask => NULL()
-  TYPE(oft_tw_block), POINTER, DIMENSION(:) :: blocks => NULL()
+  INTEGER(4) :: nblocks = 0 !< Number of blocks at this level
+  INTEGER(4), POINTER, DIMENSION(:,:) :: mat_mask => NULL() !< Interaction type matrix [nblocks, nblocks]
+  TYPE(oft_tw_block), POINTER, DIMENSION(:) :: blocks => NULL() !< Array of blocks at this level
 end type oft_tw_level
 !---------------------------------------------------------------------------------
-!> Needs docs
+!> HODLR operator for the thin-wall inductance matrix
+!!
+!! @details This type implements a hierarchical matrix representation of the
+!! inductance matrix L, providing:
+!!   - Compressed storage using low-rank off-diagonal blocks
+!!   - Efficient matrix-vector multiplication (O(N log N))
+!!   - Block-Jacobi preconditioning for iterative solvers
+!!
+!! **Storage Layout:**
+!! - dense_mats: Dense storage for diagonal blocks (near-field self-interactions)
+!! - aca_U_mats, aca_V_mats: Low-rank UV factors for off-diagonal blocks
+!! - hole_Vcoil_mat: Coupling matrix for holes and Vcoils (stored separately)
+!!
+!! **Tolerance Parameters:**
+!! - L_svd_tol: SVD truncation tolerance for L matrix compression
+!! - L_aca_tol: ACA convergence tolerance (typically > L_svd_tol)
+!! - B_svd_tol, B_aca_tol: Same for B-field reconstruction operators
+!!
+!! **Usage in ThinCurr:**
+!! 1. Call setup() to create spatial partition
+!! 2. Call compute_L() to build compressed L matrix
+!! 3. Use apply_real() for matrix-vector products
+!! 4. Use with block-Jacobi preconditioner (oft_tw_hodlr_rbjpre) for CG solver
 !---------------------------------------------------------------------------------
 type, extends(oft_noop_matrix) :: oft_tw_hodlr_op
-  INTEGER(4) :: nlevels = 0 !< Number of levels in block heirarchy
-  INTEGER(4) :: nblocks = 0 !< Number of blocks on the lowest level
-  INTEGER(4) :: ndense = 0 !< Number of diagonal interactions
-  INTEGER(4) :: nsparse = 0 !< Number of compressed off-diagonal interactions
-  INTEGER(4) :: leaf_target = 1500 !< Target size for leaves on lowest level
-  INTEGER(4) :: aca_min_its = 20 !< Minimum number of ACA+ iterations
-  INTEGER(4) :: min_rank = 10 !< Minimum rank of compressed off-diagonal matrices
-  REAL(8) :: L_svd_tol = -1.d0 !< SVD tolerance for inductance matrix
-  REAL(8) :: L_aca_tol = -1.d0 !< ACA+ tolerance for inductance matrix
-  REAL(8) :: B_svd_tol = -1.d0 !< SVD tolerance for B-field operators
-  REAL(8) :: B_aca_tol = -1.d0 !< ACA+ tolerance for B-field operators
-  INTEGER(4), POINTER, DIMENSION(:,:) :: dense_blocks => NULL() !< Indices of diagonal interactions
-  INTEGER(4), POINTER, DIMENSION(:,:) :: sparse_blocks => NULL() !< Indices of compressed off-diagonal interactions
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: aca_U_mats => NULL() !< U matrices for compressed off-diagonal interactions (L)
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: aca_V_mats => NULL() !< V matrices for compressed off-diagonal interactions (L)
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: aca_dense => NULL() !< Fallback dense matrices for compressed off-diagonal interactions (L)
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: dense_mats => NULL() !< Dense matrices for diagonal interactions (L)
-  TYPE(oft_native_dense_matrix) :: hole_Vcoil_mat !< Dense coupling matrix to holes and Vcoils (L)
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: aca_BU_mats => NULL() !< U matrices for compressed off-diagonal interactions (B-field)
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: aca_BV_mats => NULL() !< V matrices for compressed off-diagonal interactions (B-field)
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: aca_B_dense => NULL() !< Fallback dense matrices for compressed off-diagonal interactions (B-field)
-  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: dense_B_mats => NULL() !< Dense matrices for diagonal interactions (B-field)
-  REAL(8), POINTER, DIMENSION(:,:,:) :: hole_Vcoil_Bmat => NULL() !< Dense coupling matrix to holes and Vcoils (B-field)
-  REAL(8), POINTER, DIMENSION(:,:,:) :: Icoil_Bmat => NULL() !< Dense coupling matrix to Icoils (B-fieldß)
-  TYPE(oft_tw_block), POINTER, DIMENSION(:) :: blocks => NULL() !< REMOVE
-  TYPE(oft_tw_level), POINTER, DIMENSION(:) :: levels => NULL() !< Block heirarchy 
-  type(tw_type), pointer :: tw_obj => NULL()
+  INTEGER(4) :: nlevels = 0 !< Number of levels in block hierarchy
+  INTEGER(4) :: nblocks = 0 !< Number of blocks on the lowest (leaf) level
+  INTEGER(4) :: ndense = 0 !< Number of diagonal (dense) block interactions
+  INTEGER(4) :: nsparse = 0 !< Number of compressed off-diagonal block interactions
+  INTEGER(4) :: leaf_target = 1500 !< Target size for leaf blocks
+  INTEGER(4) :: aca_min_its = 20 !< Minimum ACA+ iterations before convergence check
+  INTEGER(4) :: min_rank = 10 !< Minimum rank for compressed blocks
+  REAL(8) :: L_svd_tol = -1.d0 !< SVD tolerance for inductance matrix compression
+  REAL(8) :: L_aca_tol = -1.d0 !< ACA tolerance for inductance matrix (relative to SVD tol)
+  REAL(8) :: B_svd_tol = -1.d0 !< SVD tolerance for B-field operator compression
+  REAL(8) :: B_aca_tol = -1.d0 !< ACA tolerance for B-field operator
+  INTEGER(4), POINTER, DIMENSION(:,:) :: dense_blocks => NULL() !< Indices of dense blocks [3, ndense]: (level, i, j)
+  INTEGER(4), POINTER, DIMENSION(:,:) :: sparse_blocks => NULL() !< Indices of sparse blocks [3, nsparse]: (level, i, j)
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: aca_U_mats => NULL() !< U matrices for off-diagonal blocks (L): M ~ U*V^T
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: aca_V_mats => NULL() !< V matrices for off-diagonal blocks (L)
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: aca_dense => NULL() !< Fallback dense storage for failed ACA blocks
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:) :: dense_mats => NULL() !< Dense matrices for diagonal blocks (L)
+  TYPE(oft_native_dense_matrix) :: hole_Vcoil_mat !< Coupling matrix for holes and Vcoils [nelems, nholes+n_vcoils]
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: aca_BU_mats => NULL() !< U matrices for B-field reconstruction
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: aca_BV_mats => NULL() !< V matrices for B-field reconstruction
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: aca_B_dense => NULL() !< Fallback dense storage for B-field
+  TYPE(oft_native_dense_matrix), POINTER, DIMENSION(:,:) :: dense_B_mats => NULL() !< Dense diagonal blocks for B-field
+  REAL(8), POINTER, DIMENSION(:,:,:) :: hole_Vcoil_Bmat => NULL() !< B-field coupling for holes/Vcoils
+  REAL(8), POINTER, DIMENSION(:,:,:) :: Icoil_Bmat => NULL() !< B-field coupling for Icoils
+  TYPE(oft_tw_block), POINTER, DIMENSION(:) :: blocks => NULL() !< Block array at leaf level
+  TYPE(oft_tw_level), POINTER, DIMENSION(:) :: levels => NULL() !< Array of hierarchy levels
+  type(tw_type), pointer :: tw_obj => NULL() !< Reference to parent ThinCurr object
 contains
   !> Setup HODLR by performing partitioning and tagging block-block interactions
   procedure :: setup => tw_hodlr_setup
@@ -78,11 +143,11 @@ contains
   procedure :: compute_L => tw_hodlr_Lcompute
   !> Compute compressed B-field operators
   procedure :: compute_B => tw_hodlr_Bcompute
-  !> Apply the matrix (L)
+  !> Apply the matrix (L): matrix-vector multiplication
   procedure :: apply_real => tw_hodlr_Lapply
-  !> Apply B-field operator
+  !> Apply B-field operator for magnetic field reconstruction
   procedure :: apply_bop => tw_hodlr_Bapply
-  !> Assemble matrix (L)
+  !> Assemble matrix (L) for compatibility with solver interfaces
   procedure :: assemble => tw_hodlr_Lassemble
 end type oft_tw_hodlr_op
 !------------------------------------------------------------------------------
@@ -690,7 +755,30 @@ END DO
 DEALLOCATE(quads)
 END SUBROUTINE tw_compute_Bops_block
 !---------------------------------------------------------------------------------
-!> Needs Docs
+!> Setup HODLR by performing spatial partitioning and tagging block interactions
+!!
+!! @details This subroutine sets up the HODLR matrix structure by:
+!!   1. Reading HODLR options from input file
+!!   2. Creating binary tree spatial partition using tw_part_mesh
+!!   3. Classifying block-block interactions as near-field or far-field
+!!   4. Building inverse mappings for efficient element lookup
+!!
+!! **Spatial Partitioning:**
+!! The mesh is recursively subdivided along the Cartesian axis with the largest
+!! spatial variance until each block has approximately leaf_target elements.
+!!
+!! **Interaction Classification:**
+!! For each pair of blocks (i, j):
+!! - Diagonal (i=j): Stored as dense matrix
+!! - Near-field (close): SVD compression only
+!! - Far-field: ACA+ compression allowed
+!!
+!! The classification uses the ratio:
+!! \f[ \frac{|c_i - c_j|}{r_i + r_j} \f]
+!! where c is the block center and r is the extent (circumradius).
+!!
+!! @param[inout] self HODLR operator object
+!! @param[in] required If true, abort if HODLR options not found
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_hodlr_setup(self,required)
 class(oft_tw_hodlr_op), intent(inout) :: self
@@ -873,7 +961,29 @@ END DO
 DEALLOCATE(cell_mark)
 END SUBROUTINE tw_hodlr_setup
 !---------------------------------------------------------------------------------
-!> Needs Docs
+!> Compute the compressed inductance matrix using HODLR approximation
+!!
+!! @details This subroutine builds the compressed L matrix by:
+!!   1. Computing hole and Vcoil coupling columns (dense storage)
+!!   2. Building diagonal blocks as dense matrices
+!!   3. Compressing off-diagonal blocks using SVD or ACA+
+!!
+!! **Block Processing:**
+!! - Dense blocks: Full matrix computation via tw_compute_Lmatblock
+!! - Sparse blocks with ACA+: Adaptive Cross Approximation
+!! - Sparse blocks without ACA+: Dense computation + SVD compression
+!!
+!! **Memory Savings:**
+!! The compression ratio is computed as:
+!!   (compressed storage) / (full dense storage)
+!! Typical ratios of 5-20% are achievable for large models.
+!!
+!! **File Caching:**
+!! The computed HODLR matrix can be saved to/loaded from an HDF5 file
+!! to avoid recomputation for repeated runs with the same mesh.
+!!
+!! @param[inout] self HODLR operator object
+!! @param[in] save_file Optional file path for caching the matrix
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_hodlr_Lcompute(self,save_file)
 class(oft_tw_hodlr_op), intent(inout) :: self
@@ -1107,6 +1217,29 @@ IF(TRIM(save_file)/='none')THEN
 END IF
 END SUBROUTINE load_from_file
 !
+!---------------------------------------------------------------------------------
+!> Compress a dense matrix block using SVD truncation
+!!
+!! @details This subroutine compresses a dense matrix block using Singular Value
+!! Decomposition (SVD) with truncation based on the Frobenius norm.
+!!
+!! **Algorithm:**
+!! 1. Compute full SVD: \f$ A = U S V^T \f$
+!! 2. Determine truncation rank k such that:
+!!    \f$ \sqrt{\sum_{i=k+1}^{r} \sigma_i^2} > \varepsilon \f$
+!!    (retained singular values capture sufficient energy)
+!! 3. Store truncated factors: \f$ A \approx U_k S_k V_k^T \f$
+!!
+!! **Storage Decision:**
+!! The block is stored in low-rank form only if it provides memory savings:
+!! - Dense storage: M × N elements
+!! - Low-rank storage: k × (M + N) elements
+!! - Store as low-rank if: k × (M + N) < M × N
+!!
+!! @param[in] isparse Index of the sparse block
+!! @param[in] tol SVD truncation tolerance
+!! @param[out] size_out Number of stored elements after compression
+!---------------------------------------------------------------------------------
 SUBROUTINE compress_block(isparse,tol,size_out)
 INTEGER(4), INTENT(in) :: isparse
 REAL(8), INTENT(in) :: tol
@@ -1194,6 +1327,34 @@ DO i=1,SIZE(vals)
 END DO
 END FUNCTION max_masked
 !
+!---------------------------------------------------------------------------------
+!> Adaptive Cross Approximation (ACA+) for low-rank matrix approximation
+!!
+!! @details This subroutine implements the ACA+ algorithm to compute a low-rank
+!! approximation of a matrix block without forming the full matrix.
+!!
+!! **Algorithm Overview:**
+!! The ACA+ algorithm iteratively builds an approximation:
+!! \f[ B \approx U \cdot V^T = \sum_{k=1}^{r} u_k v_k^T \f]
+!! by adaptively selecting pivot rows and columns to minimize the residual.
+!!
+!! **Key Features:**
+!! - On-the-fly matrix element evaluation (no full matrix storage)
+!! - Adaptive pivot selection based on residual magnitude
+!! - Reference row/column tracking for robust convergence
+!!
+!! **Convergence Criterion:**
+!! The algorithm stops when the Frobenius norm of the rank-1 update is below
+!! the specified tolerance: \f$ \|u_k\|_F \cdot \|v_k\|_F < \varepsilon \f$
+!!
+!! **Failure Modes:**
+!! - Returns size_out=-1 if ACA fails to converge within max_iter
+!! - Returns size_out=-2 if block is too small for ACA
+!!
+!! @param[in] isparse Index of the sparse block in sparse_blocks array
+!! @param[in] tol Convergence tolerance for ACA
+!! @param[out] size_out Number of stored elements (negative on failure)
+!---------------------------------------------------------------------------------
 SUBROUTINE aca_approx(isparse,tol,size_out)
 INTEGER(4), INTENT(in) :: isparse
 REAL(8), INTENT(in) :: tol

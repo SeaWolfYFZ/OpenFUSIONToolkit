@@ -41,17 +41,41 @@ IMPLICIT NONE
 !---------------------------------------------------------------------------------
 !> Structure containing definition of "hole" elements for multiply connected
 !! surfaces
+!!
+!! @details In the thin-wall model, surface currents are represented using a scalar
+!! potential \f$ \chi \f$ such that \f$ \mathbf{J}_s = \nabla\chi \times \hat{n} \f$.
+!! For multiply-connected geometries (e.g., cylinders, tori), a single-valued potential
+!! cannot support net current flowing around topologically non-trivial closed loops.
+!!
+!! "Hole" elements are special degrees of freedom that represent constant potentials
+!! applied to homologically non-trivial closed loops (boundary cycles or internal loops).
+!! They allow the potential to be multi-valued, enabling:
+!!   - Net current flow around boundary cycles (e.g., azimuthal current in a cylinder)
+!!   - Flux linking through holes without crossing mesh triangles
+!!   - Current flow in poloidal/toroidal directions in a torus
+!!
+!! The hole degree of freedom is stored at index (np_active + hole_index) in the solution
+!! vector, where np_active is the number of active vertices excluding hole DOFs.
+!!
+!! Key fields:
+!!   - i0: Starting vertex for the hole boundary chain
+!!   - n: Number of vertices in the boundary chain
+!!   - lp: Ordered list of vertices forming the closed boundary loop
+!!   - kpc, lpc: Cell connectivity for efficient matrix assembly
+!!   - ptcc: Geometric center of the hole for visualization/debugging
+!!
+!! @see doc_tw_main_holes in ThinCurr documentation for physical motivation
+!! @see tw_setup for hole setup and integration into the model
 !---------------------------------------------------------------------------------
 TYPE :: hole_mesh
-  INTEGER(i4) :: i0 = 0 !< Starting point for point chain
-  INTEGER(i4) :: n = 0 !< Number of points in chain
-  INTEGER(i4), POINTER, DIMENSION(:) :: lp => NULL() !< List of points in chain
-  INTEGER(i4), POINTER, DIMENSION(:) :: lp_sorted => NULL() !< Sorted list of points in chain
-  INTEGER(i4), POINTER, DIMENSION(:) :: sort_ind => NULL() !< Index from sorted list
-  INTEGER(i4), POINTER, DIMENSION(:) :: kpc => NULL() !< Pointer to point-cell linkage
-  INTEGER(i4), POINTER, DIMENSION(:) :: lpc => NULL() !< List of cells tied to each point
-  ! REAL(r8), POINTER, DIMENSION(:) :: fsign => NULL() !< Sign of 
-  REAL(r8) :: ptcc(3) = 0.d0
+  INTEGER(i4) :: i0 = 0 !< Starting point for point chain (boundary vertex)
+  INTEGER(i4) :: n = 0 !< Number of points in the boundary chain
+  INTEGER(i4), POINTER, DIMENSION(:) :: lp => NULL() !< Ordered list of vertices forming the closed boundary loop
+  INTEGER(i4), POINTER, DIMENSION(:) :: lp_sorted => NULL() !< Sorted list of points (for duplicate detection)
+  INTEGER(i4), POINTER, DIMENSION(:) :: sort_ind => NULL() !< Index mapping from sorted to original order
+  INTEGER(i4), POINTER, DIMENSION(:) :: kpc => NULL() !< Pointer array for cell-vertex linkage (CSR format)
+  INTEGER(i4), POINTER, DIMENSION(:) :: lpc => NULL() !< List of cells adjacent to each boundary vertex
+  REAL(r8) :: ptcc(3) = 0.d0 !< Geometric center of the hole boundary
 END TYPE hole_mesh
 !---------------------------------------------------------------------------------
 !> Structure containing definition of a flux loop sensor
@@ -104,22 +128,40 @@ TYPE :: tw_coil_set
 END TYPE tw_coil_set
 !---------------------------------------------------------------------------------
 !> Class for thin-wall simulation
+!!
+!! @details This class encapsulates the complete thin-wall electromagnetic model,
+!! including mesh geometry, material properties, and coupling matrices.
+!!
+!! **Degrees of Freedom Organization:**
+!! The solution vector has (np_active + nholes + n_vcoils) elements:
+!!   - Indices 1 to np_active: Active mesh vertices (potential values)
+!!   - Indices np_active+1 to np_active+nholes: Hole degrees of freedom
+!!   - Indices np_active+nholes+1 to nelems: Vcoil (voltage-driven coil) currents
+!!
+!! **Topology Handling:**
+!!   - Holes (nholes): Enable current flow around multiply-connected loops
+!!   - Closures (nclosures): Fix gauge ambiguity by grounding selected vertices
+!!
+!! **Key Arrays for Topology:**
+!!   - pmap: Maps mesh vertices to active DOF indices (0 for removed vertices)
+!!   - kfh, lfh: CSR storage for face-hole interactions in L matrix assembly
+!!   - hmesh: Detailed hole boundary definitions
 !---------------------------------------------------------------------------------
 TYPE :: tw_type
-  INTEGER(i4) :: nelems = 0 !< Number of elements in model (np_active+nholes+n_vcoils)
-  INTEGER(i4) :: np_active = 0 !< Number of active vertices in model
-  INTEGER(i4) :: n_vcoils = 0 !< Number of voltage-specified coils in model
-  INTEGER(i4) :: n_icoils = 0 !< Number of current-specified coils in model
-  INTEGER(i4) :: nholes = 0 !< Number of "holes" in model
-  INTEGER(i4) :: nclosures = 0 !< Number of "closures" in model
-  INTEGER(i4) :: nfh = 0 !< Number of face-hole interactions
-  LOGICAL, POINTER, DIMENSION(:) :: sens_mask => NULL() !< Mask array for sensors [nreg]
-  INTEGER(i4), POINTER, DIMENSION(:) :: pmap => NULL() !< Map from mesh vertices to active vertices [mesh%np]
-  INTEGER(i4), POINTER, DIMENSION(:) :: kpmap_inv => NULL() !< Map from active vertices to mesh vertices [np_active]
-  INTEGER(i4), POINTER, DIMENSION(:) :: lpmap_inv => NULL() !< Map from active vertices to mesh vertices [mesh%np]
-  INTEGER(i4), POINTER, DIMENSION(:) :: closures => NULL() !< List of closure vertices [nclosures]
-  INTEGER(i4), POINTER, DIMENSION(:) :: kfh => NULL() !< Pointer to face-hole interaction list [mesh%nc+1]
-  INTEGER(i4), POINTER, DIMENSION(:,:) :: lfh => NULL() !< List of face-hole interactions [nfh]
+  INTEGER(i4) :: nelems = 0 !< Total DOFs in model: np_active + nholes + n_vcoils
+  INTEGER(i4) :: np_active = 0 !< Number of active vertices (excluding closures)
+  INTEGER(i4) :: n_vcoils = 0 !< Number of voltage-specified coils
+  INTEGER(i4) :: n_icoils = 0 !< Number of current-specified coils
+  INTEGER(i4) :: nholes = 0 !< Number of topological "holes" for multiply-connected surfaces
+  INTEGER(i4) :: nclosures = 0 !< Number of "closure" vertices for gauge fixing on closed surfaces
+  INTEGER(i4) :: nfh = 0 !< Number of face-hole interactions (CSR storage count)
+  LOGICAL, POINTER, DIMENSION(:) :: sens_mask => NULL() !< Sensor mask for regions [nreg]
+  INTEGER(i4), POINTER, DIMENSION(:) :: pmap => NULL() !< Vertex to active-DOF map [mesh%np], 0=removed/unused
+  INTEGER(i4), POINTER, DIMENSION(:) :: kpmap_inv => NULL() !< CSR pointer for inverse vertex mapping [np_active+1]
+  INTEGER(i4), POINTER, DIMENSION(:) :: lpmap_inv => NULL() !< Inverse map: active DOF to mesh vertex [mesh%np]
+  INTEGER(i4), POINTER, DIMENSION(:) :: closures => NULL() !< List of closure vertex indices [nclosures]
+  INTEGER(i4), POINTER, DIMENSION(:) :: kfh => NULL() !< CSR pointer for face-hole interactions [mesh%nc+1]
+  INTEGER(i4), POINTER, DIMENSION(:,:) :: lfh => NULL() !< Face-hole interaction list [2,nfh]: (hole_id, local_edge)
   REAL(r8), POINTER, DIMENSION(:) :: Eta_reg => NULL() !< Resistivity*thickness values for each region [nreg]
   REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2dr => NULL() !< Element to driver (icoils) coupling matrix
   REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: Ael2coil => NULL() !< Element to coil (vcoils+icoils) coupling matrix
@@ -178,7 +220,26 @@ integer(i4), public, parameter :: tw_idx_ver=1 !< File version for array indexin
 character(LEN=16), public, parameter :: tw_idx_path="ThinCurr_Version" !< HDF5 field name
 CONTAINS
 !---------------------------------------------------------------------------------
-!> Needs Docs
+!> Setup thin-wall model including topology handling
+!!
+!! @details This subroutine initializes the thin-wall model by:
+!!   1. Loading coil definitions (vcoils, icoils)
+!!   2. Building hole definitions from boundary nodesets
+!!   3. Creating closure elements for gauge fixing
+!!   4. Setting up vertex mappings (pmap) and inverse mappings
+!!   5. Building the finite element basis arrays
+!!
+!! **Topology Handling:**
+!! - Holes are constructed from boundary nodesets, with ordered vertex chains
+!!   forming closed loops. The kfh/lfh arrays store face-hole interactions for
+!!   efficient L matrix assembly.
+!! - Closures fix the gauge by removing selected vertices from the active set.
+!!   For closed surfaces (spheres, tori), at least one closure is required.
+!! - The pmap array maps mesh vertices to active DOF indices, with removed
+!!   vertices (boundaries without holes, closures) mapped to 0.
+!!
+!! @param[inout] self Thin-wall model object
+!! @param[in] hole_ns Array of nodesets defining hole boundaries
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_setup(self,hole_ns)
 CLASS(tw_type), INTENT(INOUT) :: self !< Thin-wall model object
@@ -904,6 +965,27 @@ DEBUG_STACK_POP
 END SUBROUTINE tw_compute_Lmat_coils
 !---------------------------------------------------------------------------------
 !> Compute mutual inductance matrix between two thin-wall models
+!!
+!! @details This subroutine computes the dense inductance matrix using Biot-Savart
+!! integrals over triangular element pairs. The matrix includes contributions from:
+!!   - Vertex-to-vertex interactions (standard FEM coupling)
+!!   - Vertex-to-hole interactions (via kfh/lfh arrays)
+!!   - Hole-to-hole interactions
+!!   - Vcoil coupling (if present)
+!!
+!! **Hole DOF Indexing:**
+!! Hole degrees of freedom are stored at indices (np_active + hole_index) in the
+!! matrix. The lfh array provides the mapping from mesh faces to hole DOFs:
+!!   - lfh(1,ii): Hole index (signed for orientation)
+!!   - lfh(2,ii): Local edge index (1-3) of the triangle
+!!
+!! For self-inductance (Lself=.TRUE.), only the upper triangular portion is
+!! computed and then symmetrized, exploiting the symmetry of the L matrix.
+!!
+!! @param[in] row_model Thin-wall model for rows
+!! @param[inout] Lmat Mutual inductance matrix [col_obj%nelems, row_obj%nelems]
+!! @param[in] col_model Optional thin-wall model for columns (defaults to row_model)
+!! @param[in] save_file Optional file path for caching the computed matrix
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_compute_LmatDirect(row_model,Lmat,col_model,save_file)
 TYPE(tw_type), TARGET, INTENT(in) :: row_model !< Thin-wall model object for rows
@@ -2251,6 +2333,23 @@ END SUBROUTINE save_to_file
 END SUBROUTINE tw_compute_Bops
 !---------------------------------------------------------------------------------
 !> Setup hole definition for ordered chain of vertices
+!!
+!! @details This subroutine completes the hole definition by:
+!!   1. Computing the geometric center of the hole boundary
+!!   2. Determining face orientations relative to the hole boundary
+!!   3. Building the kpc/lpc arrays for efficient cell lookup during matrix assembly
+!!
+!! **Face Orientation:**
+!! The sign of the face orientation determines whether the face contributes to
+!! the hole current with a positive or negative sign in the L matrix. This is
+!! critical for correctly modeling current flow around the hole boundary.
+!!
+!! The orientation is propagated from boundary faces to interior faces using
+!! cell-cell connectivity, ensuring consistent sign conventions throughout
+!! the region near the hole.
+!!
+!! @param[inout] bmesh Surface mesh containing the hole
+!! @param[inout] hmesh Hole definition to be completed
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_setup_hole(bmesh,hmesh)
 CLASS(oft_bmesh), INTENT(inout) :: bmesh !< Surface mesh containing hole

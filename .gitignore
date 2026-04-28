@@ -19,6 +19,9 @@ __pycache__
 
 # Build/environment artifacts
 /builds/
+/build_release/
+/install_release/
 /oft_venv/
 /compiler_id.txt
 /setup_env.sh
+/config_cmake.sh

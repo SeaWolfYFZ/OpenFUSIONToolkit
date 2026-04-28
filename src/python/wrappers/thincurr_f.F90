@@ -31,7 +31,8 @@ USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_
   tw_recon_curr, tw_compute_Bops
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
-  tw_reduce_model, run_td_sim, plot_td_sim
+  tw_reduce_model, run_td_sim, plot_td_sim, td_step_ctx, run_td_step_init, &
+  run_td_step_advance, run_td_step_save, run_td_step_finalize
 USE mhd_utils, ONLY: mu0
 !---Wrappers
 USE oft_base_f, ONLY: copy_string, copy_string_rev
@@ -1238,4 +1239,151 @@ ELSE
 END IF
 IF(.NOT.c_associated(sensor_ptr))DEALLOCATE(sensors)
 END SUBROUTINE thincurr_reduce_model
+!---------------------------------------------------------------------------------
+!> Initialize single-step time-domain simulation context (C interface)
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_step_init(tw_ptr, dt, direct, cg_atol, cg_rtol, timestep_cn, &
+  vec_ic, hodlr_ptr, ctx_ptr, error_str) BIND(C, NAME="thincurr_td_step_init")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+REAL(KIND=c_double), VALUE, INTENT(in) :: dt
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: direct
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_atol
+REAL(KIND=c_double), VALUE, INTENT(in) :: cg_rtol
+LOGICAL(KIND=c_bool), VALUE, INTENT(in) :: timestep_cn
+TYPE(c_ptr), VALUE, INTENT(in) :: vec_ic
+TYPE(c_ptr), VALUE, INTENT(in) :: hodlr_ptr
+TYPE(c_ptr), INTENT(out) :: ctx_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+LOGICAL :: pm_save
+REAL(8), CONTIGUOUS, POINTER :: ic_tmp(:)
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(td_step_ctx), POINTER :: ctx
+TYPE(oft_tw_hodlr_op), POINTER :: hodlr_op
+!
+CALL c_f_pointer(tw_ptr, tw_obj)
+IF(tw_obj%nelems<=0)THEN
+  CALL copy_string('Invalid ThinCurr model, may not be setup yet',error_str)
+  ctx_ptr = c_null_ptr
+  RETURN
+END IF
+IF(LOGICAL(direct).AND.(c_associated(hodlr_ptr)))THEN
+  CALL copy_string('"direct=True" not supported with HODLR compression',error_str)
+  ctx_ptr = c_null_ptr
+  RETURN
+END IF
+IF((.NOT.ASSOCIATED(tw_obj%Lmat)).AND.(.NOT.c_associated(hodlr_ptr)))THEN
+  CALL copy_string('Inductance matrix required, but not computed',error_str)
+  ctx_ptr = c_null_ptr
+  RETURN
+END IF
+IF(.NOT.ASSOCIATED(tw_obj%Rmat))THEN
+  CALL copy_string('Resistance matrix required, but not computed',error_str)
+  ctx_ptr = c_null_ptr
+  RETURN
+END IF
+CALL copy_string('',error_str)
+!
+ALLOCATE(ctx)
+CALL c_f_pointer(vec_ic, ic_tmp, [tw_obj%nelems])
+!
+pm_save = oft_env%pm; oft_env%pm = .FALSE.
+IF(c_associated(hodlr_ptr))THEN
+  CALL c_f_pointer(hodlr_ptr, hodlr_op)
+  CALL run_td_step_init(tw_obj, ctx, dt, ic_tmp, LOGICAL(direct), &
+    [cg_atol, cg_rtol], LOGICAL(timestep_cn), hodlr_op=hodlr_op)
+ELSE
+  CALL run_td_step_init(tw_obj, ctx, dt, ic_tmp, LOGICAL(direct), &
+    [cg_atol, cg_rtol], LOGICAL(timestep_cn))
+END IF
+oft_env%pm = pm_save
+!
+ctx_ptr = c_loc(ctx)
+END SUBROUTINE thincurr_td_step_init
+!---------------------------------------------------------------------------------
+!> Advance solution by one time step (C interface)
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_step_advance(tw_ptr, ctx_ptr, icoil_dcurr, sol_norm, nits, &
+  elapsed_time, error_str) BIND(C, NAME="thincurr_td_step_advance")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: ctx_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: icoil_dcurr
+REAL(KIND=c_double), INTENT(out) :: sol_norm
+INTEGER(KIND=c_int), INTENT(out) :: nits
+REAL(KIND=c_double), INTENT(out) :: elapsed_time
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(td_step_ctx), POINTER :: ctx
+REAL(8), ALLOCATABLE :: dcurr_tmp(:)
+REAL(8), CONTIGUOUS, POINTER :: dcurr_ptr(:)
+!
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(ctx_ptr, ctx)
+CALL copy_string('',error_str)
+!
+IF(c_associated(icoil_dcurr))THEN
+  CALL c_f_pointer(icoil_dcurr, dcurr_ptr, [tw_obj%n_icoils])
+  CALL run_td_step_advance(tw_obj, ctx, dcurr_ptr, sol_norm, nits, elapsed_time)
+ELSE
+  ALLOCATE(dcurr_tmp(MAX(1,tw_obj%n_icoils)))
+  dcurr_tmp = 0.d0
+  CALL run_td_step_advance(tw_obj, ctx, dcurr_tmp, sol_norm, nits, elapsed_time)
+  DEALLOCATE(dcurr_tmp)
+END IF
+END SUBROUTINE thincurr_td_step_advance
+!---------------------------------------------------------------------------------
+!> Save restart/plot file for a timestep (C interface)
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_step_save(tw_ptr, ctx_ptr, icoil_curr, t, step_num, &
+  error_str) BIND(C, NAME="thincurr_td_step_save")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: ctx_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: icoil_curr
+REAL(KIND=c_double), VALUE, INTENT(in) :: t
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: step_num
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(td_step_ctx), POINTER :: ctx
+REAL(8), ALLOCATABLE :: curr_tmp(:)
+REAL(8), CONTIGUOUS, POINTER :: curr_ptr(:)
+!
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(ctx_ptr, ctx)
+CALL copy_string('',error_str)
+!
+IF(c_associated(icoil_curr).AND.(tw_obj%n_icoils>0))THEN
+  CALL c_f_pointer(icoil_curr, curr_ptr, [tw_obj%n_icoils])
+  CALL run_td_step_save(tw_obj, ctx, curr_ptr, t, step_num)
+ELSE
+  ALLOCATE(curr_tmp(MAX(1,tw_obj%n_icoils)))
+  curr_tmp = 0.d0
+  CALL run_td_step_save(tw_obj, ctx, curr_tmp, t, step_num)
+  DEALLOCATE(curr_tmp)
+END IF
+END SUBROUTINE thincurr_td_step_save
+!---------------------------------------------------------------------------------
+!> Finalize single-step time-domain simulation (C interface)
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_step_finalize(tw_ptr, ctx_ptr, vec_out, &
+  error_str) BIND(C, NAME="thincurr_td_step_finalize")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: ctx_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: vec_out
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(td_step_ctx), POINTER :: ctx
+REAL(8), CONTIGUOUS, POINTER :: vec_tmp(:)
+!
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(ctx_ptr, ctx)
+CALL copy_string('',error_str)
+!
+CALL c_f_pointer(vec_out, vec_tmp, [tw_obj%nelems])
+CALL run_td_step_finalize(tw_obj, ctx, vec_tmp)
+!
+DEALLOCATE(ctx)
+END SUBROUTINE thincurr_td_step_finalize
 END MODULE thincurr_f

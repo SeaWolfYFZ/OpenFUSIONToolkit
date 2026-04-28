@@ -32,6 +32,30 @@ USE thin_wall
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op, oft_tw_hodlr_bjpre, oft_tw_hodlr_rbjpre
 IMPLICIT NONE
 #include "local.h"
+!> Context type for single-step time-domain simulation
+!!
+!! Holds all persistent state needed between time steps, enabling
+!! external control of the time loop (e.g., for MHD coupling).
+TYPE :: td_step_ctx
+  CLASS(oft_vector), POINTER :: u => NULL()      !< Current solution vector
+  CLASS(oft_vector), POINTER :: up => NULL()     !< Previous solution vector
+  CLASS(oft_vector), POINTER :: du => NULL()     !< Delta solution (initial guess extrapolation)
+  CLASS(oft_vector), POINTER :: g => NULL()      !< RHS vector
+  CLASS(oft_matrix), POINTER :: Lmat => NULL()   !< Inductance matrix (HODLR or dense wrapper)
+  TYPE(oft_native_dense_matrix), POINTER :: Lmat_dense => NULL() !< Dense L matrix wrapper (non-HODLR)
+  TYPE(oft_sum_matrix), POINTER :: bmat => NULL() !< Backward matrix (L - dt/2*R) for CN
+  TYPE(oft_sum_matrix), POINTER :: fmat => NULL() !< Forward matrix (L + dt_op*R)
+  CLASS(oft_solver), POINTER :: linv => NULL()    !< Iterative linear solver
+  TYPE(oft_tw_hodlr_rbjpre), POINTER :: linv_pre => NULL() !< HODLR preconditioner
+  TYPE(oft_native_dense_matrix), POINTER :: Minv => NULL()  !< Dense inverse (direct solver)
+  REAL(8), POINTER :: vals(:) => NULL()         !< Local element values array
+  REAL(8) :: dt = 0.d0                           !< Time step size
+  REAL(8) :: dt_op = 0.d0                        !< Operational dt (dt/2 for CN, dt for explicit)
+  LOGICAL :: use_cn = .FALSE.                    !< Use Crank-Nicolson time stepping
+  LOGICAL :: direct_solve = .FALSE.              !< Use direct (dense) solver
+  INTEGER(4) :: nelems = 0                       !< Number of free elements
+  TYPE(oft_timer) :: solve_timer                 !< Timer for solve step
+END TYPE td_step_ctx
 CONTAINS
 !---------------------------------------------------------------------------------
 !> Compute L/R eigenmodes of ThinCurr model using a direct approach via LAPACK
@@ -1404,4 +1428,253 @@ END IF
 CALL atmp%delete()
 DEALLOCATE(vals,atmp)
 END SUBROUTINE tw_reduce_model
+!---------------------------------------------------------------------------------
+!> Initialize single-step time-domain simulation context
+!!
+!! Sets up vectors, matrices, and linear solver for time stepping.
+!! The coil current dI/dt is provided externally by the caller at each step.
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_step_init(self, ctx, dt, vec, direct, lin_tols, use_cn, hodlr_op)
+TYPE(tw_type), INTENT(in) :: self !< ThinCurr object
+TYPE(td_step_ctx), INTENT(inout) :: ctx !< Step context to initialize
+REAL(8), INTENT(in) :: dt !< Time step size
+REAL(8), INTENT(in) :: vec(:) !< Initial condition [nelems]
+LOGICAL, INTENT(in) :: direct !< Use direct (dense) solver
+REAL(8), INTENT(in) :: lin_tols(2) !< Linear solver tolerances [atol, rtol]
+LOGICAL, INTENT(in) :: use_cn !< Use Crank-Nicolson time stepping
+TYPE(oft_tw_hodlr_op), TARGET, OPTIONAL, INTENT(inout) :: hodlr_op !< HODLR L matrix
+!---
+INTEGER(4) :: i, j, info
+REAL(8) :: dt_op
+TYPE(oft_native_dense_matrix), TARGET :: Lmat_dense_local
+LOGICAL :: pm_save
+DEBUG_STACK_PUSH
+!
+ctx%dt = dt
+ctx%use_cn = use_cn
+ctx%direct_solve = direct
+ctx%nelems = self%nelems
+!
+!--- Create vectors
+CALL self%Uloc%new(ctx%u)
+CALL self%Uloc%new(ctx%up)
+CALL self%Uloc%new(ctx%du)
+CALL self%Uloc%new(ctx%g)
+!
+!--- Setup inductance matrix wrapper
+IF(PRESENT(hodlr_op))THEN
+  ctx%Lmat => hodlr_op
+ELSE
+  ALLOCATE(ctx%Lmat_dense)
+  ctx%Lmat_dense%nr = self%nelems; ctx%Lmat_dense%nc = self%nelems
+  ctx%Lmat_dense%nrg = self%nelems; ctx%Lmat_dense%ncg = self%nelems
+  ctx%Lmat_dense%M => self%Lmat
+  ctx%Lmat => ctx%Lmat_dense
+END IF
+!
+!--- Setup backward matrix wrapper (CN only)
+IF(use_cn)THEN
+  ALLOCATE(ctx%bmat)
+  ctx%bmat%nr = self%nelems; ctx%bmat%nc = self%nelems
+  ctx%bmat%nrg = self%nelems; ctx%bmat%ncg = self%nelems
+  ctx%bmat%J => ctx%Lmat
+  ctx%bmat%K => self%Rmat
+  ctx%bmat%alam = -dt/2.d0
+  dt_op = dt/2.d0
+ELSE
+  dt_op = dt
+END IF
+ctx%dt_op = dt_op
+!
+!--- Setup linear solver
+IF(.NOT.direct)THEN
+  !--- Setup forward matrix wrapper
+  ALLOCATE(ctx%fmat)
+  ctx%fmat%nr = self%nelems; ctx%fmat%nc = self%nelems
+  ctx%fmat%nrg = self%nelems; ctx%fmat%ncg = self%nelems
+  ctx%fmat%J => ctx%Lmat
+  ctx%fmat%K => self%Rmat
+  ctx%fmat%alam = dt_op
+  CALL ctx%fmat%assemble(ctx%u)
+  !--- Create CG solver for forward matrix
+  CALL create_cg_solver(ctx%linv)
+  ctx%linv%A => ctx%fmat
+  ctx%linv%its = -2
+  ctx%linv%atol = lin_tols(1)
+  ctx%linv%rtol = lin_tols(2)
+  IF(PRESENT(hodlr_op))THEN
+    ALLOCATE(ctx%linv_pre)
+    ctx%linv_pre%mf_obj => hodlr_op
+    ctx%linv_pre%Rmat => self%Rmat
+    ctx%linv_pre%alpha = 1.d0
+    ctx%linv_pre%beta = dt_op
+    ctx%linv%pre => ctx%linv_pre
+  ELSE
+    CALL create_diag_pre(ctx%linv%pre)
+  END IF
+ELSE
+  !--- Setup dense matrix for direct solve
+  ALLOCATE(ctx%Minv)
+  ctx%Minv%nr = self%nelems; ctx%Minv%nc = self%nelems
+  ctx%Minv%nrg = self%nelems; ctx%Minv%ncg = self%nelems
+  ALLOCATE(ctx%Minv%M(self%nelems, self%nelems))
+  !--- Build forward matrix [L + dt_op*R] and factorize
+  ctx%Minv%M = self%Lmat
+  DO i = 1, self%Rmat%nr
+    DO j = self%Rmat%kr(i), self%Rmat%kr(i+1)-1
+      ctx%Minv%M(i, self%Rmat%lc(j)) = ctx%Minv%M(i, self%Rmat%lc(j)) + dt_op*self%Rmat%M(j)
+    END DO
+  END DO
+  WRITE(*,'(2A)')oft_indent,'Starting factorization'
+  pm_save = oft_env%pm; oft_env%pm = .TRUE.
+  CALL lapack_cholesky(self%nelems, ctx%Minv%M, info)
+  oft_env%pm = pm_save
+END IF
+!
+!--- Initialize solution
+ALLOCATE(ctx%vals(self%nelems))
+ctx%vals = vec
+CALL ctx%u%restore_local(ctx%vals)
+CALL ctx%up%add(0.d0, 1.d0, ctx%u)
+!
+DEBUG_STACK_POP
+END SUBROUTINE run_td_step_init
+!---------------------------------------------------------------------------------
+!> Advance solution by one time step
+!!
+!! Performs the core time-step computation: applies backward matrix,
+!! subtracts coil coupling contribution, then solves the linear system.
+!! The caller provides icoil_dcurr = I_next - I_curr (the coil current
+!! increment over this timestep), computed externally.
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_step_advance(self, ctx, icoil_dcurr, sol_norm, nits, elapsed_time)
+TYPE(tw_type), INTENT(in) :: self !< ThinCurr object
+TYPE(td_step_ctx), INTENT(inout) :: ctx !< Step context
+REAL(8), INTENT(in) :: icoil_dcurr(*) !< Coil dI contribution [n_icoils]: I_next - I_curr
+REAL(8), INTENT(out) :: sol_norm !< Solution L2 norm after this step
+INTEGER(4), INTENT(out) :: nits !< Number of solver iterations
+REAL(8), INTENT(out) :: elapsed_time !< Wall-clock time for solve
+!---
+DEBUG_STACK_PUSH
+!
+!--- Apply backward matrix: g = backward * u
+IF(ctx%use_cn)THEN
+  CALL ctx%bmat%apply(ctx%u, ctx%g)
+ELSE
+  CALL ctx%Lmat%apply(ctx%u, ctx%g)
+END IF
+!
+!--- Subtract coil coupling: g -= Mc * dI/dt
+CALL ctx%g%get_local(ctx%vals)
+IF(self%n_icoils > 0)THEN
+  CALL dgemv('N', self%nelems, self%n_icoils, -1.d0, self%Ael2dr, &
+    self%nelems, icoil_dcurr, 1, 1.d0, ctx%vals, 1)
+END IF
+CALL ctx%g%restore_local(ctx%vals)
+!
+!--- Solve linear system
+CALL ctx%solve_timer%tick()
+IF(ctx%direct_solve)THEN
+  CALL ctx%Minv%apply(ctx%g, ctx%u)
+  nits = 1
+ELSE
+  ! Initial guess: extrapolate from previous solution
+  CALL ctx%du%add(0.d0, 1.d0, ctx%u)
+  CALL ctx%du%add(1.d0, -1.d0, ctx%up)
+  CALL ctx%up%add(0.d0, 1.d0, ctx%u)
+  CALL ctx%u%add(1.d0, 1.d0, ctx%du)
+  CALL ctx%linv%apply(ctx%u, ctx%g)
+  nits = ctx%linv%cits
+END IF
+elapsed_time = ctx%solve_timer%tock()
+!
+sol_norm = SQRT(ctx%u%dot(ctx%u))
+!
+DEBUG_STACK_POP
+END SUBROUTINE run_td_step_advance
+!---------------------------------------------------------------------------------
+!> Save restart/plot file for a given timestep
+!!
+!! Writes the current solution vector, time, and coil currents to an
+!! HDF5 restart file. These files are later used by plot_td_sim for
+!! post-processing.
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_step_save(self, ctx, icoil_curr, t, step_num)
+TYPE(tw_type), INTENT(in) :: self !< ThinCurr object
+TYPE(td_step_ctx), INTENT(inout) :: ctx !< Step context
+REAL(8), INTENT(in) :: icoil_curr(*) !< Coil currents at time t [n_icoils]
+REAL(8), INTENT(in) :: t !< Current simulation time
+INTEGER(4), INTENT(in) :: step_num !< Step number (used in filename)
+!---
+CHARACTER(LEN=4) :: pltnum
+DEBUG_STACK_PUSH
+WRITE(pltnum,'(I4.4)') step_num
+CALL tw_rst_save(self, ctx%u, 'pThinCurr_'//pltnum//'.rst', 'U')
+CALL hdf5_write(t, 'pThinCurr_'//pltnum//'.rst', 'time')
+IF(self%n_icoils > 0)THEN
+  CALL hdf5_write(icoil_curr(1:self%n_icoils), 'pThinCurr_'//pltnum//'.rst', 'coil_currents')
+END IF
+DEBUG_STACK_POP
+END SUBROUTINE run_td_step_save
+!---------------------------------------------------------------------------------
+!> Finalize single-step time-domain simulation
+!!
+!! Copies the final solution back to the caller's array and deallocates
+!! all context resources (vectors, matrices, solver).
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_step_finalize(self, ctx, vec)
+TYPE(tw_type), INTENT(in) :: self !< ThinCurr object
+TYPE(td_step_ctx), INTENT(inout) :: ctx !< Step context to finalize
+REAL(8), INTENT(out) :: vec(:) !< Final solution [nelems]
+!---
+DEBUG_STACK_PUSH
+!
+!--- Copy solution back
+CALL ctx%u%get_local(ctx%vals)
+vec = ctx%vals
+!
+!--- Cleanup vectors
+CALL ctx%u%delete()
+CALL ctx%up%delete()
+CALL ctx%du%delete()
+CALL ctx%g%delete()
+DEALLOCATE(ctx%u, ctx%up, ctx%du, ctx%g)
+DEALLOCATE(ctx%vals)
+!
+!--- Cleanup solver and matrices
+IF(ctx%direct_solve)THEN
+  IF(ASSOCIATED(ctx%Minv))THEN
+    DEALLOCATE(ctx%Minv%M)
+    DEALLOCATE(ctx%Minv)
+    NULLIFY(ctx%Minv)
+  END IF
+ELSE
+  IF(ASSOCIATED(ctx%linv))THEN
+    IF(ASSOCIATED(ctx%linv%pre))THEN
+      CALL ctx%linv%pre%delete()
+      IF(ASSOCIATED(ctx%linv_pre))DEALLOCATE(ctx%linv_pre)
+    END IF
+    CALL ctx%linv%delete()
+    DEALLOCATE(ctx%linv)
+    NULLIFY(ctx%linv)
+  END IF
+END IF
+!
+IF(ASSOCIATED(ctx%fmat))THEN
+  DEALLOCATE(ctx%fmat)
+  NULLIFY(ctx%fmat)
+END IF
+IF(ASSOCIATED(ctx%bmat))THEN
+  DEALLOCATE(ctx%bmat)
+  NULLIFY(ctx%bmat)
+END IF
+IF(ASSOCIATED(ctx%Lmat_dense))THEN
+  DEALLOCATE(ctx%Lmat_dense)
+  NULLIFY(ctx%Lmat_dense)
+END IF
+NULLIFY(ctx%Lmat)
+!
+CALL oft_decrease_indent
+DEBUG_STACK_POP
+END SUBROUTINE run_td_step_finalize
 END MODULE thin_wall_solvers

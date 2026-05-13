@@ -32,6 +32,30 @@ USE thin_wall
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op, oft_tw_hodlr_bjpre, oft_tw_hodlr_rbjpre
 IMPLICIT NONE
 #include "local.h"
+!---------------------------------------------------------------------------------
+!> Persistent state for single-step time-domain advancement
+!---------------------------------------------------------------------------------
+TYPE, PUBLIC :: tw_td_state
+  LOGICAL :: initialized = .FALSE.
+  LOGICAL :: use_cn = .FALSE.
+  LOGICAL :: direct = .FALSE.
+  REAL(8) :: dt = 0.d0
+  REAL(8) :: dt_op = 0.d0
+  TYPE(tw_type), POINTER :: tw_obj => NULL()
+  CLASS(oft_vector), POINTER :: u => NULL()
+  CLASS(oft_vector), POINTER :: up => NULL()
+  CLASS(oft_vector), POINTER :: g => NULL()
+  CLASS(oft_vector), POINTER :: du => NULL()
+  CLASS(oft_matrix), POINTER :: Lmat => NULL()
+  TYPE(oft_sum_matrix), POINTER :: fmat => NULL()
+  TYPE(oft_sum_matrix), POINTER :: bmat => NULL()
+  CLASS(oft_solver), POINTER :: linv => NULL()
+  TYPE(oft_native_dense_matrix), POINTER :: Minv => NULL()
+  TYPE(oft_tw_hodlr_op), POINTER :: hodlr_op => NULL()
+  TYPE(oft_native_dense_matrix), POINTER :: Lmat_dense => NULL()
+  TYPE(oft_tw_hodlr_rbjpre), POINTER :: linv_pre => NULL()
+  REAL(8), POINTER :: vals(:) => NULL()
+END TYPE tw_td_state
 CONTAINS
 !---------------------------------------------------------------------------------
 !> Compute L/R eigenmodes of ThinCurr model using a direct approach via LAPACK
@@ -1404,4 +1428,239 @@ END IF
 CALL atmp%delete()
 DEALLOCATE(vals,atmp)
 END SUBROUTINE tw_reduce_model
+!---------------------------------------------------------------------------------
+!> Initialise single-step time-domain solver.
+!> Sets up matrices / factorisations / solver for the chosen scheme.
+!> Must be called once before any tw_td_step().
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_td_init(state,self,dt,use_cn,direct,lin_tols,hodlr_op)
+TYPE(tw_td_state), INTENT(inout) :: state
+TYPE(tw_type), INTENT(in), TARGET :: self
+REAL(8), INTENT(in) :: dt
+LOGICAL, INTENT(in) :: use_cn
+LOGICAL, INTENT(in) :: direct
+REAL(8), INTENT(in) :: lin_tols(2)
+TYPE(oft_tw_hodlr_op), TARGET, OPTIONAL, INTENT(inout) :: hodlr_op
+INTEGER(4) :: i,j,info
+LOGICAL :: pm_save
+
+IF(state%initialized) CALL oft_abort("tw_td_init called on initialized state", &
+  "tw_td_init", __FILE__)
+
+state%tw_obj => self
+state%dt = dt
+state%use_cn = use_cn
+state%direct = direct
+
+!--- local vectors
+CALL self%Uloc%new(state%u)
+CALL self%Uloc%new(state%up)
+CALL self%Uloc%new(state%du)
+CALL self%Uloc%new(state%g)
+
+!--- inductance wrapper
+IF(PRESENT(hodlr_op))THEN
+  state%hodlr_op => hodlr_op
+  state%Lmat => hodlr_op
+ELSE
+  ALLOCATE(state%Lmat_dense)
+  state%Lmat_dense%nr=self%nelems; state%Lmat_dense%nc=self%nelems
+  state%Lmat_dense%nrg=self%nelems; state%Lmat_dense%ncg=self%nelems
+  state%Lmat_dense%M => self%Lmat
+  state%Lmat => state%Lmat_dense
+END IF
+
+!--- backward matrix (L - dt_op*R)
+IF(use_cn)THEN
+  ALLOCATE(state%bmat)
+  state%bmat%nr=self%nelems; state%bmat%nc=self%nelems
+  state%bmat%nrg=self%nelems; state%bmat%ncg=self%nelems
+  state%bmat%J => state%Lmat
+  state%bmat%K => self%Rmat
+  state%bmat%alam = -dt/2.d0
+  state%dt_op = dt/2.d0
+ELSE
+  state%dt_op = dt
+END IF
+
+!--- forward matrix and solver
+IF(.NOT.direct)THEN
+  ALLOCATE(state%fmat)
+  state%fmat%nr=self%nelems; state%fmat%nc=self%nelems
+  state%fmat%nrg=self%nelems; state%fmat%ncg=self%nelems
+  state%fmat%J => state%Lmat
+  state%fmat%K => self%Rmat
+  state%fmat%alam = state%dt_op
+  CALL state%fmat%assemble(state%u)
+  CALL create_cg_solver(state%linv)
+  state%linv%A => state%fmat
+  state%linv%its = -2
+  state%linv%atol = lin_tols(1)
+  state%linv%rtol = lin_tols(2)
+  IF(PRESENT(hodlr_op))THEN
+    ALLOCATE(state%linv_pre)
+    state%linv_pre%mf_obj => hodlr_op
+    state%linv_pre%Rmat => self%Rmat
+    state%linv_pre%alpha = 1.d0
+    state%linv_pre%beta  = state%fmat%alam
+    state%linv%pre => state%linv_pre
+  ELSE
+    CALL create_diag_pre(state%linv%pre)
+  END IF
+ELSE
+  ALLOCATE(state%Minv)
+  state%Minv%nr=self%nelems; state%Minv%nc=self%nelems
+  state%Minv%nrg=self%nelems; state%Minv%ncg=self%nelems
+  ALLOCATE(state%Minv%M(state%Minv%nr,state%Minv%nr))
+  state%Minv%M = self%Lmat
+  DO i=1,self%Rmat%nr
+    DO j=self%Rmat%kr(i),self%Rmat%kr(i+1)-1
+      state%Minv%M(i,self%Rmat%lc(j)) = state%Minv%M(i,self%Rmat%lc(j)) &
+        + state%dt_op*self%Rmat%M(j)
+    END DO
+  END DO
+  pm_save = oft_env%pm; oft_env%pm = .TRUE.
+  CALL lapack_cholesky(state%Minv%nr,state%Minv%M,info)
+  oft_env%pm = pm_save
+END IF
+
+!--- workspace for vec ↔ local transfers
+ALLOCATE(state%vals(self%nelems))
+state%initialized = .TRUE.
+END SUBROUTINE tw_td_init
+!---------------------------------------------------------------------------------
+!> Set the initial solution vector (call after tw_td_init, before stepping).
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_td_set_ic(state,vec)
+TYPE(tw_td_state), INTENT(inout) :: state
+REAL(8), INTENT(in) :: vec(:)
+state%vals = vec
+CALL state%u%restore_local(state%vals)
+CALL state%up%add(0.d0,1.d0,state%u)
+END SUBROUTINE tw_td_set_ic
+!---------------------------------------------------------------------------------
+!> Single time step.
+!>   vec(:)       – solution vector [in/out]
+!>   icoil_dcurr  – coil dI contributions already scaled as needed by the scheme
+!>   vcoil_volt   – voltage coil contributions already scaled as needed
+!>   nits_out     – CG iterations (output, 1 for direct solve)
+!>
+!> The caller computes icoil_dcurr and vcoil_volt *outside* OFT.
+!> For Crank-Nicolson the convention is:
+!>     icoil_dcurr = [ I(t+dt/4)-I(t-dt/4) + I(t+5dt/4)-I(t+3dt/4) ]
+!>     vcoil_volt  = [ (V(t)+V(t+dt))/2 ] * dt          (full-vector)
+!> or  vcoil_volt  = [ (Vj(t)+Vj(t+dt))/2 * dt for j=1,n_vcoils ]
+!> For backward Euler:
+!>     icoil_dcurr = 2*[ I(t+5dt/4)-I(t+3dt/4) ]
+!>     vcoil_volt  = [ V(t+dt) ] * dt
+!>
+!> If the current data is strictly at 1 ms intervals and dt=1 ms,
+!> the caller can use algebraic differences without interpolation:
+!>   CN:  dI = (I(k+1)-I(k-1)) + (I(k+2)-I(k))   (since t = k*dt)
+!>   BE:  dI = 2*(I(k+2)-I(k))
+!>   vcoils are handled similarly.
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_td_step(state,vec,icoil_dcurr,n_icoils,vcoil_volt,n_vcoils,nits_out)
+TYPE(tw_td_state), INTENT(inout) :: state
+REAL(8), INTENT(inout) :: vec(:)
+REAL(8), INTENT(in) :: icoil_dcurr(:)
+INTEGER(4), INTENT(in) :: n_icoils
+REAL(8), INTENT(in) :: vcoil_volt(:)
+INTEGER(4), INTENT(in) :: n_vcoils
+INTEGER(4), INTENT(out), OPTIONAL :: nits_out
+INTEGER(4) :: j
+LOGICAL :: pm_save
+TYPE(tw_type), POINTER :: self
+
+IF(.NOT.state%initialized) CALL oft_abort("tw_td_step: state not initialized", &
+  "tw_td_step", __FILE__)
+self => state%tw_obj
+
+!--- Restore u from input vec
+state%vals = vec
+CALL state%u%restore_local(state%vals)
+
+!--- Build RHS:  (L - dt_op*R)*u   or   L*u
+IF(state%use_cn)THEN
+  CALL state%bmat%apply(state%u, state%g)    ! g = (L - dt/2*R) * u
+ELSE
+  CALL state%Lmat%apply(state%u, state%g)    ! g = L * u
+END IF
+
+!--- Add coil and voltage driver contributions
+CALL state%g%get_local(state%vals)
+IF(n_icoils > 0) &
+  CALL dgemv('N',self%nelems,n_icoils,-1.d0,self%Ael2dr, &
+    self%nelems,icoil_dcurr,1,1.d0,state%vals,1)
+IF(n_vcoils == self%nelems)THEN
+  state%vals = state%vals + vcoil_volt
+ELSE
+  DO j=1,MIN(n_vcoils,self%n_vcoils)
+    state%vals(self%np_active + self%nholes + j) = &
+      state%vals(self%np_active + self%nholes + j) + vcoil_volt(j)
+  END DO
+END IF
+CALL state%g%restore_local(state%vals)
+
+!--- Solve:  (L + dt_op*R) * u_new = g
+pm_save = oft_env%pm; oft_env%pm = .FALSE.
+IF(state%direct)THEN
+  CALL state%Minv%apply(state%g, state%u)
+  IF(PRESENT(nits_out)) nits_out = 1
+ELSE
+  CALL state%du%add(0.d0,1.d0,state%u)
+  CALL state%du%add(1.d0,-1.d0,state%up)
+  CALL state%up%add(0.d0,1.d0,state%u)
+  CALL state%u%add(1.d0,1.d0,state%du)
+  CALL state%linv%apply(state%u, state%g)
+  IF(PRESENT(nits_out)) nits_out = state%linv%cits
+END IF
+oft_env%pm = pm_save
+
+!--- Return solution
+CALL state%u%get_local(state%vals)
+vec = state%vals
+END SUBROUTINE tw_td_step
+!---------------------------------------------------------------------------------
+!> Save solution to plot file (HDF5 restart format).
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_td_save(state,step,t,icoil_curr)
+TYPE(tw_td_state), INTENT(inout) :: state
+INTEGER(4), INTENT(in) :: step
+REAL(8), INTENT(in) :: t
+REAL(8), INTENT(in) :: icoil_curr(:)
+CHARACTER(LEN=4) :: pltnum
+WRITE(pltnum,'(I4.4)') step
+CALL tw_rst_save(state%tw_obj,state%u,'pThinCurr_'//pltnum//'.rst','U')
+CALL hdf5_write(t,'pThinCurr_'//pltnum//'.rst','time')
+CALL hdf5_write(icoil_curr,'pThinCurr_'//pltnum//'.rst','coil_currents')
+END SUBROUTINE tw_td_save
+!---------------------------------------------------------------------------------
+!> Clean up solver state.
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_td_finalize(state)
+TYPE(tw_td_state), INTENT(inout) :: state
+IF(.NOT.state%initialized) RETURN
+CALL state%u%delete();   DEALLOCATE(state%u)
+CALL state%up%delete();  DEALLOCATE(state%up)
+CALL state%du%delete();  DEALLOCATE(state%du)
+CALL state%g%delete();   DEALLOCATE(state%g)
+IF(ASSOCIATED(state%vals)) DEALLOCATE(state%vals)
+IF(ASSOCIATED(state%Lmat_dense)) DEALLOCATE(state%Lmat_dense)
+IF(ASSOCIATED(state%bmat)) DEALLOCATE(state%bmat)
+IF(state%direct)THEN
+  IF(ASSOCIATED(state%Minv))THEN
+    DEALLOCATE(state%Minv%M); DEALLOCATE(state%Minv)
+  END IF
+ELSE
+  IF(ASSOCIATED(state%linv))THEN
+    CALL state%linv%pre%delete()
+    IF(.NOT.ASSOCIATED(state%hodlr_op)) DEALLOCATE(state%linv%pre)
+    CALL state%linv%delete(); DEALLOCATE(state%linv)
+  END IF
+  IF(ASSOCIATED(state%linv_pre)) DEALLOCATE(state%linv_pre)
+  IF(ASSOCIATED(state%fmat)) DEALLOCATE(state%fmat)
+END IF
+state%initialized = .FALSE.
+END SUBROUTINE tw_td_finalize
 END MODULE thin_wall_solvers

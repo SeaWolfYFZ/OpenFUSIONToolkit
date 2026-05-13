@@ -31,7 +31,8 @@ USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_
   tw_recon_curr, tw_compute_Bops
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
-  tw_reduce_model, run_td_sim, plot_td_sim
+  tw_reduce_model, run_td_sim, plot_td_sim, tw_td_state, tw_td_init, tw_td_set_ic, &
+  tw_td_step, tw_td_save, tw_td_finalize
 USE mhd_utils, ONLY: mu0
 !---Wrappers
 USE oft_base_f, ONLY: copy_string, copy_string_rev
@@ -1238,4 +1239,98 @@ ELSE
 END IF
 IF(.NOT.c_associated(sensor_ptr))DEALLOCATE(sensors)
 END SUBROUTINE thincurr_reduce_model
+!---------------------------------------------------------------------------------
+!> C-binding: initialise single-step time-domain solver
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_init(tw_ptr,state_ptr,dt,use_cn,direct,cg_atol,cg_rtol,hodlr_ptr,error_str) &
+  BIND(C,NAME="thincurr_td_init")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), INTENT(out) :: state_ptr
+REAL(c_double), VALUE, INTENT(in) :: dt
+LOGICAL(c_bool), VALUE, INTENT(in) :: use_cn
+LOGICAL(c_bool), VALUE, INTENT(in) :: direct
+REAL(c_double), VALUE, INTENT(in) :: cg_atol
+REAL(c_double), VALUE, INTENT(in) :: cg_rtol
+TYPE(c_ptr), VALUE, INTENT(in) :: hodlr_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(tw_td_state), POINTER :: state
+TYPE(oft_tw_hodlr_op), POINTER :: hodlr_op
+CALL copy_string('',error_str)
+CALL c_f_pointer(tw_ptr, tw_obj)
+ALLOCATE(state)
+IF(c_associated(hodlr_ptr))THEN
+  CALL c_f_pointer(hodlr_ptr, hodlr_op)
+  CALL tw_td_init(state,tw_obj,dt,LOGICAL(use_cn),LOGICAL(direct),[cg_atol,cg_rtol],hodlr_op=hodlr_op)
+ELSE
+  CALL tw_td_init(state,tw_obj,dt,LOGICAL(use_cn),LOGICAL(direct),[cg_atol,cg_rtol])
+END IF
+state_ptr = C_LOC(state)
+END SUBROUTINE thincurr_td_init
+!---------------------------------------------------------------------------------
+!> C-binding: set initial condition
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_set_ic(state_ptr,vec,error_str) BIND(C,NAME="thincurr_td_set_ic")
+TYPE(c_ptr), VALUE, INTENT(in) :: state_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: vec
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+TYPE(tw_td_state), POINTER :: state
+REAL(8), POINTER :: vec_tmp(:)
+CALL copy_string('',error_str)
+CALL c_f_pointer(state_ptr, state)
+CALL c_f_pointer(vec, vec_tmp, [state%tw_obj%nelems])
+CALL tw_td_set_ic(state,vec_tmp)
+END SUBROUTINE thincurr_td_set_ic
+!---------------------------------------------------------------------------------
+!> C-binding: single time step
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_step(state_ptr,vec,icoil_dcurr,n_icoils,vcoil_volt,n_vcoils,nits,error_str) &
+  BIND(C,NAME="thincurr_td_step")
+TYPE(c_ptr), VALUE, INTENT(in) :: state_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: vec
+TYPE(c_ptr), VALUE, INTENT(in) :: icoil_dcurr
+INTEGER(c_int), VALUE, INTENT(in) :: n_icoils
+TYPE(c_ptr), VALUE, INTENT(in) :: vcoil_volt
+INTEGER(c_int), VALUE, INTENT(in) :: n_vcoils
+INTEGER(c_int), INTENT(out) :: nits
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+TYPE(tw_td_state), POINTER :: state
+REAL(8), POINTER :: vec_tmp(:),id_tmp(:),vv_tmp(:)
+CALL copy_string('',error_str)
+CALL c_f_pointer(state_ptr, state)
+CALL c_f_pointer(vec, vec_tmp, [state%tw_obj%nelems])
+IF(n_icoils>0) CALL c_f_pointer(icoil_dcurr, id_tmp, [n_icoils])
+IF(n_vcoils>0) CALL c_f_pointer(vcoil_volt, vv_tmp, [n_vcoils])
+CALL tw_td_step(state,vec_tmp,id_tmp,n_icoils,vv_tmp,n_vcoils,nits)
+END SUBROUTINE thincurr_td_step
+!---------------------------------------------------------------------------------
+!> C-binding: save plot output
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_save(state_ptr,step,t,icoil_curr,error_str) BIND(C,NAME="thincurr_td_save")
+TYPE(c_ptr), VALUE, INTENT(in) :: state_ptr
+INTEGER(c_int), VALUE, INTENT(in) :: step
+REAL(c_double), VALUE, INTENT(in) :: t
+TYPE(c_ptr), VALUE, INTENT(in) :: icoil_curr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+TYPE(tw_td_state), POINTER :: state
+REAL(8), POINTER :: ic_tmp(:)
+CALL copy_string('',error_str)
+CALL c_f_pointer(state_ptr, state)
+CALL c_f_pointer(icoil_curr, ic_tmp, [state%tw_obj%n_icoils])
+CALL tw_td_save(state,step,t,ic_tmp)
+END SUBROUTINE thincurr_td_save
+!---------------------------------------------------------------------------------
+!> C-binding: finalize solver state
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_finalize(state_ptr,error_str) BIND(C,NAME="thincurr_td_finalize")
+TYPE(c_ptr), INTENT(inout) :: state_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+TYPE(tw_td_state), POINTER :: state
+CALL copy_string('',error_str)
+IF(.NOT.c_associated(state_ptr)) RETURN
+CALL c_f_pointer(state_ptr, state)
+CALL tw_td_finalize(state)
+DEALLOCATE(state)
+state_ptr = c_null_ptr
+END SUBROUTINE thincurr_td_finalize
 END MODULE thincurr_f

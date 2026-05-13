@@ -2243,6 +2243,262 @@ END IF
 END SUBROUTINE save_to_file
 END SUBROUTINE tw_compute_Bops
 !---------------------------------------------------------------------------------
+!> Compute B-field reconstruction operator at arbitrary user-provided points.
+!> Uses the same near-field / far-field algorithm as tw_compute_Bops, but
+!> evaluates B at pts_user(3, np_user) instead of mesh vertices.
+!> Outputs: B_user(nelems, np_user, 3) — element DOF → B at user point
+!>          B_dr_user(np_user, n_icoils, 3) — icoil → B at user point
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_compute_Bops_user(self,np_user,pts_user,B_user,B_dr_user,save_file)
+TYPE(tw_type), INTENT(inout) :: self
+INTEGER(4), INTENT(in) :: np_user
+REAL(8), INTENT(in), TARGET :: pts_user(3,np_user)
+REAL(8), CONTIGUOUS, POINTER, INTENT(inout) :: B_user(:,:,:)
+REAL(8), CONTIGUOUS, POINTER, INTENT(inout) :: B_dr_user(:,:,:)
+CHARACTER(LEN=*), OPTIONAL, INTENT(in) :: save_file
+REAL(r8) :: evec_i(3,3),pts_i(3,3),pt_i(3),pt_j(3),diffvec(3),ecc(3)
+REAL(r8) :: cvec(3),cpt(3),tmp,area_i,dl_min,dl_max,norm_j(3),f(3),elapsed_time
+REAL(r8), ALLOCATABLE :: atmp(:,:,:)
+REAL(8), PARAMETER :: B_dx = 1.d-6
+INTEGER(4) :: i,ii,j,jj,ik,k,kk,iquad
+LOGICAL :: is_neighbor,load_success
+CLASS(oft_bmesh), POINTER :: bmesh
+TYPE(oft_quad_type), ALLOCATABLE :: quads(:)
+type(oft_timer) :: mytimer
+IF(PRESENT(save_file))THEN
+  load_success=load_from_file()
+  IF(load_success)RETURN
+END IF
+!
+bmesh=>self%mesh
+ALLOCATE(quads(18))
+DO i=1,18
+  CALL set_quad_2d(quads(i),i)
+END DO
+!---Pre-allocate before element operator to avoid heap corruption
+IF(.NOT.ASSOCIATED(B_user)) ALLOCATE(B_user(self%nelems,np_user,3))
+IF(.NOT.ASSOCIATED(B_dr_user)) ALLOCATE(B_dr_user(np_user,MAX(1,self%n_icoils),3))
+B_user=0.d0
+B_dr_user=0.d0
+f=1.d0/3.d0
+WRITE(*,'(2A,I8)')oft_indent,'Building element->user-point B operator: np_user=',np_user
+CALL mytimer%tick
+!$omp parallel private(ii,j,jj,ik,pts_i,tmp,pt_i,pt_j,evec_i, &
+!$omp atmp,i,area_i,dl_min,dl_max,norm_j,diffvec,is_neighbor,iquad)
+ALLOCATE(atmp(3,3,np_user))
+!$omp do schedule(dynamic,100)
+DO i=1,bmesh%nc
+  area_i=bmesh%ca(i)
+  DO ii=1,3
+    pts_i(:,ii)=bmesh%r(:,bmesh%lc(ii,i))
+    evec_i(:,ii)=self%qbasis(:,ii,i)
+  END DO
+  CALL bmesh%norm(i,f,norm_j)
+  atmp=0.d0
+  DO j=1,np_user
+    pt_j=pts_user(:,j)
+    !---Compute minimum separation
+    dl_min=1.d99
+    dl_max=SQRT(MAX(area_i,1.d0)) ! rough bound, user points may be distant
+    DO ii=1,3
+      dl_min=MIN(dl_min,SQRT(SUM((pts_i(:,ii)-pt_j)**2)))
+      dl_max=MAX(dl_max,SQRT(SUM((pts_i(:,ii)-pt_j)**2)))
+    END DO
+    IF(dl_min<1.d-8)THEN
+      iquad=18; is_neighbor=.TRUE.
+    ELSE
+      iquad=MAX(4,MIN(18,ABS(INT(LOG(target_err)/LOG(1.d0-dl_min/dl_max)))))
+      is_neighbor=.FALSE.
+    END IF
+    !
+    IF(iquad>10)THEN
+      IF(is_neighbor)THEN
+        pt_j=pt_j - norm_j*10.d0*B_dx
+      END IF
+      diffvec=0.d0
+      DO ik=1,2
+        IF(ik==2)pt_j=pt_j+norm_j*20.d0*B_dx
+        DO jj=1,3
+          pt_j(jj)=pt_j(jj)+B_dx
+          tmp=tw_compute_phipot(pts_i,pt_j)
+          diffvec(jj)=diffvec(jj)+tmp/(2.d0*B_dx)
+          pt_j(jj)=pt_j(jj)-2.d0*B_dx
+          tmp=tw_compute_phipot(pts_i,pt_j)
+          diffvec(jj)=diffvec(jj)-tmp/(2.d0*B_dx)
+          pt_j(jj)=pt_j(jj)+B_dx
+        END DO
+        IF(.NOT.is_neighbor)EXIT
+      END DO
+      IF(is_neighbor)diffvec=diffvec/2.d0
+      DO ik=1,3
+        atmp(1,ik,j) = diffvec(2)*evec_i(3,ik) - diffvec(3)*evec_i(2,ik)
+        atmp(2,ik,j) = diffvec(3)*evec_i(1,ik) - diffvec(1)*evec_i(3,ik)
+        atmp(3,ik,j) = diffvec(1)*evec_i(2,ik) - diffvec(2)*evec_i(1,ik)
+      END DO
+    ELSE
+      DO ik=1,3
+        diffvec=0.d0
+        DO ii=1,quads(iquad)%np
+          pt_i = pt_j - (quads(iquad)%pts(1,ii)*pts_i(:,1) &
+            + quads(iquad)%pts(2,ii)*pts_i(:,2) &
+            + quads(iquad)%pts(3,ii)*pts_i(:,3))
+          diffvec = diffvec + cross_product(evec_i(:,ik),pt_i)*quads(iquad)%wts(ii)/(SUM(pt_i**2))**1.5d0
+        END DO
+        atmp(:,ik,j) = diffvec*area_i
+      END DO
+    END IF
+  END DO
+  !---Assemble mesh vertex contributions
+  DO ii=1,3
+    ik=self%pmap(bmesh%lc(ii,i))
+    IF(ik==0)CYCLE
+    DO j=1,np_user
+      DO jj=1,3
+        !$omp atomic
+        B_user(ik,j,jj) = B_user(ik,j,jj) + atmp(jj,ii,j)
+      END DO
+    END DO
+  END DO
+  !---Assemble hole contributions
+  DO ii=self%kfh(i),self%kfh(i+1)-1
+    ik=ABS(self%lfh(1,ii))+self%np_active
+    DO j=1,np_user
+      DO jj=1,3
+        tmp=SIGN(1,self%lfh(1,ii))*atmp(jj,self%lfh(2,ii),j)
+        !$omp atomic
+        B_user(ik,j,jj) = B_user(ik,j,jj) + tmp
+      END DO
+    END DO
+  END DO
+END DO
+DEALLOCATE(atmp)
+!$omp end parallel
+B_user=B_user/(4.d0*pi)
+!
+DO i=1,18
+  CALL quads(i)%delete()
+END DO
+DEALLOCATE(quads)
+elapsed_time=mytimer%tock()
+WRITE(*,'(3A)')oft_indent,'  Time = ',time_to_string(elapsed_time)
+!---Driver coil contributions (Biot-Savart line integral for icoils)
+IF(self%n_icoils>0)THEN
+  WRITE(*,'(2A)')oft_indent,'Building icoil->user-point B operator'
+  !$omp parallel do private(ii,j,k,kk,pt_j,ecc,diffvec,cvec,cpt)
+  DO i=1,np_user
+    pt_j=pts_user(:,i)
+    !---Compute driver contributions
+    DO j=1,self%n_icoils
+      ecc = 0.d0
+      IF(self%icoils(j)%sens_mask)CYCLE
+      DO k=1,self%icoils(j)%ncoils
+        diffvec=0.d0
+        DO kk=2,self%icoils(j)%coils(k)%npts
+          cvec = self%icoils(j)%coils(k)%pts(:,kk)-self%icoils(j)%coils(k)%pts(:,kk-1)
+          cpt = (self%icoils(j)%coils(k)%pts(:,kk)+self%icoils(j)%coils(k)%pts(:,kk-1))/2.d0
+          diffvec = diffvec + cross_product(cvec,pt_j-cpt)/SUM((pt_j-cpt)**2)**1.5d0
+        END DO
+        ecc=ecc+self%icoils(j)%scales(k)*diffvec
+      END DO
+      DO jj=1,3
+        B_dr_user(i,j,jj) = B_dr_user(i,j,jj) + ecc(jj)
+      END DO
+    END DO
+  END DO
+  B_dr_user=B_dr_user*mu0/(4.d0*pi)
+END IF
+!
+IF(PRESENT(save_file)) CALL save_to_file()
+CONTAINS
+FUNCTION load_from_file() RESULT(exists)
+INTEGER(4) :: hash_tmp(6),file_counts(6)
+LOGICAL :: exists
+IF(TRIM(save_file)/='none')THEN
+  INQUIRE(FILE=TRIM(save_file),EXIST=exists)
+  IF(exists)THEN
+    hash_tmp(1)=self%nelems; hash_tmp(2)=np_user
+    hash_tmp(3)=self%mesh%nc
+    hash_tmp(4)=oft_simple_hash(C_LOC(self%mesh%lc),INT(4*3*self%mesh%nc,8))
+    hash_tmp(5)=oft_simple_hash(C_LOC(self%mesh%r),INT(8*3*self%mesh%np,8))
+    hash_tmp(6)=oft_simple_hash(C_LOC(pts_user),INT(8*3*np_user,8))
+    CALL hdf5_read(file_counts,TRIM(save_file),'MODEL_hash',success=exists)
+    IF(exists.AND.ALL(file_counts(1:6)==hash_tmp))THEN
+      ALLOCATE(B_user(self%nelems,np_user,3))
+      CALL hdf5_read(B_user(:,:,1),TRIM(save_file),'Buser_X',success=exists)
+      IF(exists)CALL hdf5_read(B_user(:,:,2),TRIM(save_file),'Buser_Y',success=exists)
+      IF(exists)CALL hdf5_read(B_user(:,:,3),TRIM(save_file),'Buser_Z',success=exists)
+      IF(exists)THEN
+        ALLOCATE(B_dr_user(np_user,MAX(1,self%n_icoils),3))
+        CALL hdf5_read(B_dr_user(:,:,1),TRIM(save_file),'Bdruser_X',success=exists)
+        IF(exists)CALL hdf5_read(B_dr_user(:,:,2),TRIM(save_file),'Bdruser_Y',success=exists)
+        IF(exists)CALL hdf5_read(B_dr_user(:,:,3),TRIM(save_file),'Bdruser_Z',success=exists)
+      END IF
+    END IF
+    IF(exists)RETURN
+    IF(ASSOCIATED(B_user))DEALLOCATE(B_user)
+    IF(ASSOCIATED(B_dr_user))DEALLOCATE(B_dr_user)
+  END IF
+ELSE
+  exists=.FALSE.
+END IF
+END FUNCTION load_from_file
+SUBROUTINE save_to_file()
+INTEGER(4) :: hash_tmp(6)
+IF(TRIM(save_file)/='none')THEN
+  hash_tmp(1)=self%nelems; hash_tmp(2)=np_user
+  hash_tmp(3)=self%mesh%nc
+  hash_tmp(4)=oft_simple_hash(C_LOC(self%mesh%lc),INT(4*3*self%mesh%nc,8))
+  hash_tmp(5)=oft_simple_hash(C_LOC(self%mesh%r),INT(8*3*self%mesh%np,8))
+  hash_tmp(6)=oft_simple_hash(C_LOC(pts_user),INT(8*3*np_user,8))
+  WRITE(*,'(2A)')oft_indent,'Saving B-user operator to file: ',TRIM(save_file)
+  CALL hdf5_create_file(TRIM(save_file))
+  CALL hdf5_write(hash_tmp,TRIM(save_file),'MODEL_hash')
+  CALL hdf5_write(B_user(:,:,1),TRIM(save_file),'Buser_X')
+  CALL hdf5_write(B_user(:,:,2),TRIM(save_file),'Buser_Y')
+  CALL hdf5_write(B_user(:,:,3),TRIM(save_file),'Buser_Z')
+  IF(self%n_icoils>0)THEN
+    CALL hdf5_write(B_dr_user(:,:,1),TRIM(save_file),'Bdruser_X')
+    CALL hdf5_write(B_dr_user(:,:,2),TRIM(save_file),'Bdruser_Y')
+    CALL hdf5_write(B_dr_user(:,:,3),TRIM(save_file),'Bdruser_Z')
+  END IF
+END IF
+END SUBROUTINE save_to_file
+END SUBROUTINE tw_compute_Bops_user
+!---------------------------------------------------------------------------------
+!> Apply precomputed B-user operator: B_out = B_user * pot + B_dr_user * coils
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_Buser_apply(self,pot,coils,np_user,B_user,B_dr_user,B_out)
+TYPE(tw_type), INTENT(in) :: self
+REAL(8), INTENT(in) :: pot(:),coils(:)
+INTEGER(4), INTENT(in) :: np_user
+REAL(8), INTENT(in) :: B_user(:,:,:),B_dr_user(:,:,:)
+REAL(8), INTENT(out) :: B_out(3,np_user)
+INTEGER(4) :: j,jj,k
+REAL(8) :: tmp
+!$omp parallel do private(j,jj,k,tmp) collapse(2)
+DO j=1,np_user
+  DO jj=1,3
+    tmp=0.d0
+    DO k=1,self%nelems
+      tmp=tmp+pot(k)*B_user(k,j,jj)
+    END DO
+    B_out(jj,j)=tmp
+  END DO
+END DO
+IF(self%n_icoils>0)THEN
+  !$omp parallel do private(j,jj,k,tmp) collapse(2)
+  DO j=1,np_user
+    DO jj=1,3
+      tmp=0.d0
+      DO k=1,self%n_icoils
+        tmp=tmp+coils(k)*B_dr_user(j,k,jj)
+      END DO
+      B_out(jj,j)=B_out(jj,j)+tmp
+    END DO
+  END DO
+END IF
+END SUBROUTINE tw_Buser_apply
+!---------------------------------------------------------------------------------
 !> Setup hole definition for ordered chain of vertices
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_setup_hole(bmesh,hmesh)

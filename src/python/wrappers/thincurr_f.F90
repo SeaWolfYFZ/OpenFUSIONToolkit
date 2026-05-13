@@ -26,9 +26,9 @@ USE oft_mesh_native, ONLY: r_mem, lc_mem, reg_mem, native_read_nodesets, native_
 USE oft_la_base, ONLY: oft_vector
 !---
 USE fem_utils, ONLY: fem_interp
-USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_Rmat, &
-  tw_compute_Ael2dr, tw_sensors, tw_compute_mutuals, tw_load_sensors, tw_compute_Lmat_MF, &
-  tw_recon_curr, tw_compute_Bops
+  USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_Rmat, &
+    tw_compute_Ael2dr, tw_sensors, tw_compute_mutuals, tw_load_sensors, tw_compute_Lmat_MF, &
+    tw_recon_curr, tw_compute_Bops, tw_compute_Bops_user, tw_Buser_apply
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
   tw_reduce_model, run_td_sim, plot_td_sim, tw_td_state, tw_td_init, tw_td_set_ic, &
@@ -1333,4 +1333,59 @@ CALL tw_td_finalize(state)
 DEALLOCATE(state)
 state_ptr = c_null_ptr
 END SUBROUTINE thincurr_td_finalize
+!---------------------------------------------------------------------------------
+!> C-binding: precompute B operator at user-provided points
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_compute_B_user(tw_ptr,np_user,pts_user,B_user_ptr,Bdr_user_ptr,cache_file,error_str) &
+  BIND(C,NAME="thincurr_compute_B_user")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+INTEGER(c_int), VALUE, INTENT(in) :: np_user
+TYPE(c_ptr), VALUE, INTENT(in) :: pts_user
+TYPE(c_ptr), INTENT(out) :: B_user_ptr
+TYPE(c_ptr), INTENT(out) :: Bdr_user_ptr
+CHARACTER(KIND=c_char), INTENT(in) :: cache_file(OFT_PATH_SLEN)
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+CHARACTER(LEN=OFT_PATH_SLEN) :: filename
+TYPE(tw_type), POINTER :: tw_obj
+REAL(8), CONTIGUOUS, POINTER :: B_user(:,:,:),B_dr_user(:,:,:)
+REAL(8), POINTER :: pts_tmp(:,:)
+CALL copy_string('',error_str)
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(pts_user, pts_tmp, [3,np_user])
+! Compute B_user and B_dr_user separately to avoid heap corruption
+ALLOCATE(B_user(tw_obj%nelems,np_user,3))
+ALLOCATE(B_dr_user(np_user,MAX(1,tw_obj%n_icoils),3))
+CALL copy_string_rev(cache_file,filename)
+IF(TRIM(filename)=='')THEN
+  CALL tw_compute_Bops_user(tw_obj,np_user,pts_tmp,B_user,B_dr_user)
+ELSE
+  CALL tw_compute_Bops_user(tw_obj,np_user,pts_tmp,B_user,B_dr_user,save_file=filename)
+END IF
+B_user_ptr = C_LOC(B_user)
+Bdr_user_ptr = C_LOC(B_dr_user)
+END SUBROUTINE thincurr_compute_B_user
+!---------------------------------------------------------------------------------
+!> C-binding: apply precomputed B-user operator to get B at user points
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_B_user_apply(tw_ptr,pot,coils,np_user,B_user,B_dr_user,B_out,error_str) &
+  BIND(C,NAME="thincurr_B_user_apply")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: pot
+TYPE(c_ptr), VALUE, INTENT(in) :: coils
+INTEGER(c_int), VALUE, INTENT(in) :: np_user
+TYPE(c_ptr), VALUE, INTENT(in) :: B_user
+TYPE(c_ptr), VALUE, INTENT(in) :: B_dr_user
+TYPE(c_ptr), VALUE, INTENT(in) :: B_out
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+TYPE(tw_type), POINTER :: tw_obj
+REAL(8), POINTER :: pot_tmp(:),coils_tmp(:),B_user_tmp(:,:,:),B_dr_user_tmp(:,:,:),B_out_tmp(:,:)
+CALL copy_string('',error_str)
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(pot, pot_tmp, [tw_obj%nelems])
+CALL c_f_pointer(coils, coils_tmp, [tw_obj%n_icoils])
+CALL c_f_pointer(B_user, B_user_tmp, [tw_obj%nelems,np_user,3])
+CALL c_f_pointer(B_dr_user, B_dr_user_tmp, [np_user,tw_obj%n_icoils,3])
+CALL c_f_pointer(B_out, B_out_tmp, [3,np_user])
+CALL tw_Buser_apply(tw_obj,pot_tmp,coils_tmp,np_user,B_user_tmp,B_dr_user_tmp,B_out_tmp)
+END SUBROUTINE thincurr_B_user_apply
 END MODULE thincurr_f

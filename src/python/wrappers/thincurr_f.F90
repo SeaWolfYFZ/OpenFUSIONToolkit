@@ -28,11 +28,11 @@ USE oft_la_base, ONLY: oft_vector
 USE fem_utils, ONLY: fem_interp
 USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_Rmat, &
   tw_compute_Ael2dr, tw_sensors, tw_compute_mutuals, tw_load_sensors, tw_compute_Lmat_MF, &
-  tw_recon_curr, tw_compute_Bops
+  tw_recon_curr, tw_compute_Bops, tw_compute_Bops_at_points
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
   tw_reduce_model, run_td_sim, plot_td_sim, td_step_ctx, run_td_step_init, &
-  run_td_step_advance, run_td_step_save, run_td_step_finalize
+  run_td_step_advance, run_td_step_save, run_td_step_finalize, run_td_step_get_solution
 USE mhd_utils, ONLY: mu0
 !---Wrappers
 USE oft_base_f, ONLY: copy_string, copy_string_rev
@@ -42,6 +42,14 @@ IMPLICIT NONE
 integer(i4), POINTER :: lc_plot(:,:) !< Needs docs
 integer(i4), POINTER :: reg_plot(:) !< Needs docs
 real(r8), POINTER :: r_plot(:,:) !< Needs docs
+!
+TYPE :: tw_Bops_custom_ctx
+  REAL(8), ALLOCATABLE :: Bel(:,:,:)
+  REAL(8), ALLOCATABLE :: Bdr(:,:,:)
+  INTEGER(4) :: nelems = 0
+  INTEGER(4) :: npts = 0
+  INTEGER(4) :: n_icoils = 0
+END TYPE tw_Bops_custom_ctx
 CONTAINS
 !---------------------------------------------------------------------------------
 !> Needs docs
@@ -1386,4 +1394,121 @@ CALL run_td_step_finalize(tw_obj, ctx, vec_tmp)
 !
 DEALLOCATE(ctx)
 END SUBROUTINE thincurr_td_step_finalize
+!---------------------------------------------------------------------------------
+!> Get current solution from step context (C interface)
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_td_step_get_solution(tw_ptr, ctx_ptr, vec_out, &
+  error_str) BIND(C, NAME="thincurr_td_step_get_solution")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: ctx_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: vec_out
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+TYPE(tw_type), POINTER :: tw_obj
+TYPE(td_step_ctx), POINTER :: ctx
+REAL(8), CONTIGUOUS, POINTER :: vec_tmp(:)
+!
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL c_f_pointer(ctx_ptr, ctx)
+CALL copy_string('',error_str)
+!
+CALL c_f_pointer(vec_out, vec_tmp, [tw_obj%nelems])
+CALL run_td_step_get_solution(tw_obj, ctx, vec_tmp)
+END SUBROUTINE thincurr_td_step_get_solution
+!---------------------------------------------------------------------------------
+!> Build B-field operators at custom observation points (C interface)
+!!
+!! Allocates a Bops context on the heap. Caller must free with
+!! thincurr_free_Bops_custom when done.
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_build_Bops_custom(tw_ptr, pts_ptr, npts, bops_ptr, &
+  error_str) BIND(C, NAME="thincurr_build_Bops_custom")
+TYPE(c_ptr), VALUE, INTENT(in) :: tw_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: pts_ptr
+INTEGER(KIND=c_int), VALUE, INTENT(in) :: npts
+TYPE(c_ptr), INTENT(out) :: bops_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+TYPE(tw_type), POINTER :: tw_obj
+REAL(8), CONTIGUOUS, POINTER :: pts_tmp(:,:)
+TYPE(tw_Bops_custom_ctx), POINTER :: bops
+!
+CALL c_f_pointer(tw_ptr, tw_obj)
+CALL copy_string('',error_str)
+IF(tw_obj%nelems <= 0)THEN
+  CALL copy_string('Invalid ThinCurr model',error_str)
+  bops_ptr = c_null_ptr
+  RETURN
+END IF
+!
+CALL c_f_pointer(pts_ptr, pts_tmp, [3, npts])
+!
+ALLOCATE(bops)
+CALL tw_compute_Bops_at_points(tw_obj, pts_tmp, npts, bops%Bel, bops%Bdr)
+bops%nelems = tw_obj%nelems
+bops%npts = npts
+bops%n_icoils = tw_obj%n_icoils
+!
+bops_ptr = c_loc(bops)
+END SUBROUTINE thincurr_build_Bops_custom
+!---------------------------------------------------------------------------------
+!> Apply B-field operators to compute B at custom points (C interface)
+!!
+!! Computes B = Bel^T * eta + Bdr * I_coil for each component.
+!! B_out must be pre-allocated as double[3 * npts] (column-major: Bx0,Bx1,...,By0,...).
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_apply_Bops_custom(bops_ptr, eta_ptr, icoil_ptr, B_out_ptr, &
+  error_str) BIND(C, NAME="thincurr_apply_Bops_custom")
+TYPE(c_ptr), VALUE, INTENT(in) :: bops_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: eta_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: icoil_ptr
+TYPE(c_ptr), VALUE, INTENT(in) :: B_out_ptr
+CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
+!
+TYPE(tw_Bops_custom_ctx), POINTER :: bops
+REAL(8), CONTIGUOUS, POINTER :: eta_tmp(:)
+REAL(8), CONTIGUOUS, POINTER :: icoil_tmp(:)
+REAL(8), CONTIGUOUS, POINTER :: B_tmp(:,:)
+INTEGER(4) :: jj
+!
+CALL c_f_pointer(bops_ptr, bops)
+CALL copy_string('',error_str)
+!
+CALL c_f_pointer(eta_ptr, eta_tmp, [bops%nelems])
+CALL c_f_pointer(B_out_ptr, B_tmp, [bops%npts, 3])
+B_tmp = 0.d0
+!
+!--- B = Bel^T * eta for each component
+! Bel is [nelems, npts, 3], so Bel(:,:,jj) is [nelems, npts]
+! We want B(:,jj) = Bel(:,:,jj)^T * eta
+DO jj=1,3
+  CALL dgemv('T', bops%nelems, bops%npts, 1.d0, bops%Bel(1,1,jj), bops%nelems, &
+    eta_tmp, 1, 0.d0, B_tmp(1,jj), 1)
+END DO
+!
+!--- B += Bdr * I_coil for each component
+! Bdr is [npts, n_icoils, 3], so Bdr(:,:,jj) is [npts, n_icoils]
+IF(c_associated(icoil_ptr) .AND. bops%n_icoils > 0)THEN
+  CALL c_f_pointer(icoil_ptr, icoil_tmp, [bops%n_icoils])
+  DO jj=1,3
+    CALL dgemv('N', bops%npts, bops%n_icoils, 1.d0, bops%Bdr(1,1,jj), bops%npts, &
+      icoil_tmp, 1, 1.d0, B_tmp(1,jj), 1)
+  END DO
+END IF
+END SUBROUTINE thincurr_apply_Bops_custom
+!---------------------------------------------------------------------------------
+!> Free B-field operators context (C interface)
+!---------------------------------------------------------------------------------
+SUBROUTINE thincurr_free_Bops_custom(bops_ptr) BIND(C, NAME="thincurr_free_Bops_custom")
+TYPE(c_ptr), VALUE, INTENT(in) :: bops_ptr
+!
+TYPE(tw_Bops_custom_ctx), POINTER :: bops
+!
+IF(c_associated(bops_ptr))THEN
+  CALL c_f_pointer(bops_ptr, bops)
+  IF(ALLOCATED(bops%Bel)) DEALLOCATE(bops%Bel)
+  IF(ALLOCATED(bops%Bdr)) DEALLOCATE(bops%Bdr)
+  DEALLOCATE(bops)
+END IF
+END SUBROUTINE thincurr_free_Bops_custom
 END MODULE thincurr_f

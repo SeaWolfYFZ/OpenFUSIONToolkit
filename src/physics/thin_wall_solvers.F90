@@ -1555,6 +1555,7 @@ REAL(8), INTENT(out) :: sol_norm !< Solution L2 norm after this step
 INTEGER(4), INTENT(out) :: nits !< Number of solver iterations
 REAL(8), INTENT(out) :: elapsed_time !< Wall-clock time for solve
 !---
+LOGICAL :: pm_save
 DEBUG_STACK_PUSH
 !
 !--- Apply backward matrix: g = backward * u
@@ -1574,6 +1575,7 @@ CALL ctx%g%restore_local(ctx%vals)
 !
 !--- Solve linear system
 CALL ctx%solve_timer%tick()
+pm_save = oft_env%pm; oft_env%pm = .FALSE.
 IF(ctx%direct_solve)THEN
   CALL ctx%Minv%apply(ctx%g, ctx%u)
   nits = 1
@@ -1586,6 +1588,7 @@ ELSE
   CALL ctx%linv%apply(ctx%u, ctx%g)
   nits = ctx%linv%cits
 END IF
+oft_env%pm = pm_save
 elapsed_time = ctx%solve_timer%tock()
 !
 sol_norm = SQRT(ctx%u%dot(ctx%u))
@@ -1677,4 +1680,19 @@ NULLIFY(ctx%Lmat)
 CALL oft_decrease_indent
 DEBUG_STACK_POP
 END SUBROUTINE run_td_step_finalize
+!---------------------------------------------------------------------------------
+!> Get current solution vector from step context
+!!
+!! Copies the current solution from the internal vector to the caller's array.
+!---------------------------------------------------------------------------------
+SUBROUTINE run_td_step_get_solution(self, ctx, vec)
+TYPE(tw_type), INTENT(in) :: self !< ThinCurr object
+TYPE(td_step_ctx), INTENT(inout) :: ctx !< Step context
+REAL(8), INTENT(out) :: vec(:) !< Solution vector [nelems]
+!---
+DEBUG_STACK_PUSH
+CALL ctx%u%get_local(ctx%vals)
+vec = ctx%vals
+DEBUG_STACK_POP
+END SUBROUTINE run_td_step_get_solution
 END MODULE thin_wall_solvers

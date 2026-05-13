@@ -2243,6 +2243,199 @@ END IF
 END SUBROUTINE save_to_file
 END SUBROUTINE tw_compute_Bops
 !---------------------------------------------------------------------------------
+!> Compute B-field reconstruction operators at arbitrary observation points
+!!
+!! Given a set of observation point coordinates, computes the dense operator
+!! matrices that map element currents (Bel) and driver coil currents (Bdr)
+!! to the magnetic field at those points via Biot-Savart integration.
+!---------------------------------------------------------------------------------
+SUBROUTINE tw_compute_Bops_at_points(self, pts, npts, Bel_out, Bdr_out)
+TYPE(tw_type), INTENT(in) :: self !< ThinCurr object
+REAL(r8), INTENT(in) :: pts(3, npts) !< Observation point coordinates [3, npts]
+INTEGER(i4), INTENT(in) :: npts !< Number of observation points
+REAL(r8), ALLOCATABLE, INTENT(out) :: Bel_out(:,:,:) !< [nelems, npts, 3]
+REAL(r8), ALLOCATABLE, INTENT(out) :: Bdr_out(:,:,:) !< [npts, n_icoils, 3]
+!---
+REAL(r8) :: evec_i(3,3),pts_i(3,3),pt_i(3),pt_j(3),diffvec(3),ecc(3),cvec(3),cpt(3)
+REAL(r8) :: tmp,area_i,dl_min,dl_max,norm_j(3),f(3)
+REAL(r8), ALLOCATABLE :: atmp(:,:,:)
+REAL(r8), PARAMETER :: B_dx = 1.d-6
+INTEGER(i4) :: i,ii,j,jj,ik,k,kk,iquad
+LOGICAL :: is_neighbor
+CLASS(oft_bmesh), POINTER :: bmesh
+TYPE(oft_quad_type), ALLOCATABLE :: quads(:)
+DEBUG_STACK_PUSH
+!
+bmesh => self%mesh
+f = 1.d0/3.d0
+!
+ALLOCATE(quads(18))
+DO i=1,18
+  CALL set_quad_2d(quads(i),i)
+END DO
+!
+!--- Build element -> observation point B-field operator
+ALLOCATE(Bel_out(self%nelems, npts, 3))
+Bel_out = 0.d0
+!
+WRITE(*,'(2A,I7,A)')oft_indent,'Building B-field operator at custom points (',npts,' points)'
+!$omp parallel private(ii,j,jj,ik,pts_i,tmp,pt_i,pt_j,evec_i, &
+!$omp atmp,i,area_i,dl_min,dl_max,norm_j,diffvec,is_neighbor,iquad)
+ALLOCATE(atmp(3,3,npts))
+!$omp do schedule(dynamic,100)
+DO i=1,bmesh%nc
+  area_i = bmesh%ca(i)
+  DO ii=1,3
+    pts_i(:,ii) = bmesh%r(:,bmesh%lc(ii,i))
+    evec_i(:,ii) = self%qbasis(:,ii,i)
+  END DO
+  CALL bmesh%norm(i,f,norm_j)
+  atmp = 0.d0
+  DO j=1,npts
+    pt_j = pts(:,j)
+    !--- Compute minimum separation
+    dl_min = 1.d99
+    dl_max = SQRT(area_i)
+    DO ii=1,3
+      dl_min = MIN(dl_min, SQRT(SUM((pts_i(:,ii) - pt_j)**2)))
+      dl_max = MAX(dl_max, SQRT(SUM((pts_i(:,ii) - pt_j)**2)))
+    END DO
+    !--- Chose quadrature order based on distance
+    IF(dl_min < 1.d-8)THEN
+      iquad = 18
+      is_neighbor = .TRUE.
+    ELSE
+      iquad = MAX(4, MIN(18, ABS(INT(LOG(target_err)/LOG(1.d0 - dl_min/dl_max)))))
+      is_neighbor = .FALSE.
+    END IF
+    !
+    IF(iquad > 10)THEN
+      IF(is_neighbor)THEN
+        pt_j = pt_j - norm_j*10.d0*B_dx
+      END IF
+      diffvec = 0.d0
+      DO ik=1,2
+        IF(ik == 2) pt_j = pt_j + norm_j*20.d0*B_dx
+        DO jj=1,3
+          pt_j(jj) = pt_j(jj) + B_dx
+          tmp = tw_compute_phipot(pts_i, pt_j)
+          diffvec(jj) = diffvec(jj) + tmp/(2.d0*B_dx)
+          pt_j(jj) = pt_j(jj) - 2.d0*B_dx
+          tmp = tw_compute_phipot(pts_i, pt_j)
+          diffvec(jj) = diffvec(jj) + tmp/(2.d0*B_dx)
+          pt_j(jj) = pt_j(jj) + B_dx
+        END DO
+        IF(.NOT.is_neighbor) EXIT
+      END DO
+      IF(is_neighbor) diffvec = diffvec/2.d0
+      DO ik=1,3
+        atmp(1,ik,j) = diffvec(2)*evec_i(3,ik) - diffvec(3)*evec_i(2,ik)
+        atmp(2,ik,j) = diffvec(3)*evec_i(1,ik) - diffvec(1)*evec_i(3,ik)
+        atmp(3,ik,j) = diffvec(1)*evec_i(2,ik) - diffvec(2)*evec_i(1,ik)
+      END DO
+    ELSE
+      DO ik=1,3
+        diffvec = 0.d0
+        DO ii=1,quads(iquad)%np
+          pt_i = pt_j - (quads(iquad)%pts(1,ii)*pts_i(:,1) &
+            + quads(iquad)%pts(2,ii)*pts_i(:,2) &
+            + quads(iquad)%pts(3,ii)*pts_i(:,3))
+          diffvec = diffvec + cross_product(evec_i(:,ik),pt_i)*quads(iquad)%wts(ii)/(SUM(pt_i**2))**1.5d0
+        END DO
+        atmp(:,ik,j) = diffvec*area_i
+      END DO
+    END IF
+  END DO
+  !--- Scatter to global Bel using pmap and hole mappings
+  DO ii=1,3
+    ik = self%pmap(bmesh%lc(ii,i))
+    IF(ik == 0) CYCLE
+    DO j=1,npts
+      DO jj=1,3
+        !$omp atomic
+        Bel_out(ik,j,jj) = Bel_out(ik,j,jj) + atmp(jj,ii,j)
+      END DO
+    END DO
+  END DO
+  DO ii=self%kfh(i),self%kfh(i+1)-1
+    ik = ABS(self%lfh(1,ii)) + self%np_active
+    DO j=1,npts
+      DO jj=1,3
+        tmp = SIGN(1,self%lfh(1,ii))*atmp(jj,self%lfh(2,ii),j)
+        !$omp atomic
+        Bel_out(ik,j,jj) = Bel_out(ik,j,jj) + tmp
+      END DO
+    END DO
+  END DO
+END DO
+DEALLOCATE(atmp)
+!$omp end parallel
+!
+!--- Build vcoil -> observation point contributions
+IF(self%n_vcoils > 0)THEN
+  WRITE(*,'(2A)')oft_indent,'Adding vcoil contributions to B-field operator'
+  !$omp parallel do private(ii,j,k,kk,pt_j,ecc,diffvec,cvec,cpt)
+  DO j=1,npts
+    pt_j = pts(:,j)
+    DO i=1,self%n_vcoils
+      ecc = 0.d0
+      IF(self%vcoils(i)%sens_mask) CYCLE
+      DO k=1,self%vcoils(i)%ncoils
+        diffvec = 0.d0
+        DO kk=2,self%vcoils(i)%coils(k)%npts
+          cvec = self%vcoils(i)%coils(k)%pts(:,kk) - self%vcoils(i)%coils(k)%pts(:,kk-1)
+          cpt = (self%vcoils(i)%coils(k)%pts(:,kk) + self%vcoils(i)%coils(k)%pts(:,kk-1))/2.d0
+          diffvec = diffvec + cross_product(cvec,pt_j-cpt)/SUM((pt_j-cpt)**2)**1.5d0
+        END DO
+        ecc = ecc + self%vcoils(i)%scales(k)*diffvec
+      END DO
+      DO jj=1,3
+        !$omp atomic
+        Bel_out(self%np_active+self%nholes+i,j,jj) = &
+          Bel_out(self%np_active+self%nholes+i,j,jj) + ecc(jj)
+      END DO
+    END DO
+  END DO
+END IF
+Bel_out = Bel_out/(4.d0*pi)
+!
+!--- Build icoil -> observation point B-field operator
+ALLOCATE(Bdr_out(npts, self%n_icoils, 3))
+Bdr_out = 0.d0
+IF(self%n_icoils > 0)THEN
+  WRITE(*,'(2A)')oft_indent,'Building icoil B-field operator at custom points'
+  !$omp parallel do private(ii,j,k,kk,pt_j,ecc,diffvec,cvec,cpt)
+  DO j=1,npts
+    pt_j = pts(:,j)
+    DO i=1,self%n_icoils
+      ecc = 0.d0
+      IF(self%icoils(i)%sens_mask) CYCLE
+      DO k=1,self%icoils(i)%ncoils
+        diffvec = 0.d0
+        DO kk=2,self%icoils(i)%coils(k)%npts
+          cvec = self%icoils(i)%coils(k)%pts(:,kk) - self%icoils(i)%coils(k)%pts(:,kk-1)
+          cpt = (self%icoils(i)%coils(k)%pts(:,kk) + self%icoils(i)%coils(k)%pts(:,kk-1))/2.d0
+          diffvec = diffvec + cross_product(cvec,pt_j-cpt)/SUM((pt_j-cpt)**2)**1.5d0
+        END DO
+        ecc = ecc + self%icoils(i)%scales(k)*diffvec
+      END DO
+      DO jj=1,3
+        !$omp atomic
+        Bdr_out(j,i,jj) = Bdr_out(j,i,jj) + ecc(jj)
+      END DO
+    END DO
+  END DO
+END IF
+Bdr_out = Bdr_out*mu0/(4.d0*pi)
+!
+DO i=1,18
+  CALL quads(i)%delete()
+END DO
+DEALLOCATE(quads)
+!
+DEBUG_STACK_POP
+END SUBROUTINE tw_compute_Bops_at_points
+!---------------------------------------------------------------------------------
 !> Setup hole definition for ordered chain of vertices
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_setup_hole(bmesh,hmesh)

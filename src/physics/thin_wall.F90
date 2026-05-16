@@ -2298,8 +2298,10 @@ DO i=1,bmesh%nc
   DO j=1,np_user
     pt_j=pts_user(:,j)
     !---Compute minimum separation
+    !  Initial dl_max uses cell length scale (matches upstream tw_compute_Bops);
+    !  the 3-vertex loop below extends it with actual point-to-vertex distances.
     dl_min=1.d99
-    dl_max=SQRT(MAX(area_i,1.d0)) ! rough bound, user points may be distant
+    dl_max=SQRT(area_i*2.d0)
     DO ii=1,3
       dl_min=MIN(dl_min,SQRT(SUM((pts_i(:,ii)-pt_j)**2)))
       dl_max=MAX(dl_max,SQRT(SUM((pts_i(:,ii)-pt_j)**2)))
@@ -2373,6 +2375,35 @@ DO i=1,bmesh%nc
 END DO
 DEALLOCATE(atmp)
 !$omp end parallel
+!---V-coil contributions to B_user (mirrors tw_compute_Bops vcoil block).
+!   V-coil DOFs occupy B_user(np_active+nholes+1..nelems, :, :), so the line
+!   integral here is added to the same operator and shares the /(4*pi) scale
+!   below — no extra mu0 factor (the pot vector for v-coil DOFs uses the same
+!   "magnetic units" convention as wall DOFs).
+IF(self%n_vcoils>0)THEN
+  WRITE(*,'(2A)')oft_indent,'Building vcoil->user-point B operator'
+  !$omp parallel do private(j,k,kk,pt_j,ecc,diffvec,cvec,cpt,jj)
+  DO i=1,np_user
+    pt_j=pts_user(:,i)
+    DO j=1,self%n_vcoils
+      ecc=0.d0
+      IF(self%vcoils(j)%sens_mask)CYCLE
+      DO k=1,self%vcoils(j)%ncoils
+        diffvec=0.d0
+        DO kk=2,self%vcoils(j)%coils(k)%npts
+          cvec = self%vcoils(j)%coils(k)%pts(:,kk)-self%vcoils(j)%coils(k)%pts(:,kk-1)
+          cpt = (self%vcoils(j)%coils(k)%pts(:,kk)+self%vcoils(j)%coils(k)%pts(:,kk-1))/2.d0
+          diffvec = diffvec + cross_product(cvec,pt_j-cpt)/SUM((pt_j-cpt)**2)**1.5d0
+        END DO
+        ecc=ecc+self%vcoils(j)%scales(k)*diffvec
+      END DO
+      DO jj=1,3
+        B_user(self%np_active+self%nholes+j,i,jj) = &
+          B_user(self%np_active+self%nholes+j,i,jj) + ecc(jj)
+      END DO
+    END DO
+  END DO
+END IF
 B_user=B_user/(4.d0*pi)
 !
 DO i=1,18
@@ -2423,20 +2454,21 @@ IF(TRIM(save_file)/='none')THEN
     hash_tmp(6)=oft_simple_hash(C_LOC(pts_user),INT(8*3*np_user,8))
     CALL hdf5_read(file_counts,TRIM(save_file),'MODEL_hash',success=exists)
     IF(exists.AND.ALL(file_counts(1:6)==hash_tmp))THEN
-      ALLOCATE(B_user(self%nelems,np_user,3))
+      !  Caller (C binding) may have pre-allocated these arrays; only allocate
+      !  if not already associated so we don't orphan caller's buffers.
+      IF(.NOT.ASSOCIATED(B_user)) ALLOCATE(B_user(self%nelems,np_user,3))
       CALL hdf5_read(B_user(:,:,1),TRIM(save_file),'Buser_X',success=exists)
       IF(exists)CALL hdf5_read(B_user(:,:,2),TRIM(save_file),'Buser_Y',success=exists)
       IF(exists)CALL hdf5_read(B_user(:,:,3),TRIM(save_file),'Buser_Z',success=exists)
       IF(exists)THEN
-        ALLOCATE(B_dr_user(np_user,MAX(1,self%n_icoils),3))
+        IF(.NOT.ASSOCIATED(B_dr_user)) ALLOCATE(B_dr_user(np_user,MAX(1,self%n_icoils),3))
         CALL hdf5_read(B_dr_user(:,:,1),TRIM(save_file),'Bdruser_X',success=exists)
         IF(exists)CALL hdf5_read(B_dr_user(:,:,2),TRIM(save_file),'Bdruser_Y',success=exists)
         IF(exists)CALL hdf5_read(B_dr_user(:,:,3),TRIM(save_file),'Bdruser_Z',success=exists)
       END IF
     END IF
-    IF(exists)RETURN
-    IF(ASSOCIATED(B_user))DEALLOCATE(B_user)
-    IF(ASSOCIATED(B_dr_user))DEALLOCATE(B_dr_user)
+    !  On partial failure leave the (possibly caller-allocated) buffers in place;
+    !  the normal computation path below zeros them and rebuilds from scratch.
   END IF
 ELSE
   exists=.FALSE.

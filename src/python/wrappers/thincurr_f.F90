@@ -26,9 +26,9 @@ USE oft_mesh_native, ONLY: r_mem, lc_mem, reg_mem, native_read_nodesets, native_
 USE oft_la_base, ONLY: oft_vector
 !---
 USE fem_utils, ONLY: fem_interp
-  USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_Rmat, &
-    tw_compute_Ael2dr, tw_sensors, tw_compute_mutuals, tw_load_sensors, tw_compute_Lmat_MF, &
-    tw_recon_curr, tw_compute_Bops, tw_compute_Bops_user, tw_Buser_apply
+USE thin_wall, ONLY: tw_type, tw_save_pfield, tw_compute_LmatDirect, tw_compute_Rmat, &
+  tw_compute_Ael2dr, tw_sensors, tw_compute_mutuals, tw_load_sensors, tw_compute_Lmat_MF, &
+  tw_recon_curr, tw_compute_Bops, tw_compute_Bops_user, tw_Buser_apply
 USE thin_wall_hodlr, ONLY: oft_tw_hodlr_op
 USE thin_wall_solvers, ONLY: lr_eigenmodes_arpack, lr_eigenmodes_direct, frequency_response, &
   tw_reduce_model, run_td_sim, plot_td_sim, tw_td_state, tw_td_init, tw_td_set_ic, &
@@ -1296,12 +1296,28 @@ INTEGER(c_int), INTENT(out) :: nits
 CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN)
 TYPE(tw_td_state), POINTER :: state
 REAL(8), POINTER :: vec_tmp(:),id_tmp(:),vv_tmp(:)
+LOGICAL :: id_dummy=.FALSE., vv_dummy=.FALSE.
 CALL copy_string('',error_str)
 CALL c_f_pointer(state_ptr, state)
 CALL c_f_pointer(vec, vec_tmp, [state%tw_obj%nelems])
-IF(n_icoils>0) CALL c_f_pointer(icoil_dcurr, id_tmp, [n_icoils])
-IF(n_vcoils>0) CALL c_f_pointer(vcoil_volt, vv_tmp, [n_vcoils])
+!  When the caller passes NULL/0-count buffers, allocate length-0 placeholders
+!  rather than leaving id_tmp / vv_tmp with indeterminate association status.
+!  tw_td_step's inner code is already guarded by n_icoils/n_vcoils > 0, so the
+!  placeholders are never read — they only ensure the assumed-shape dummy
+!  argument receives a well-defined array.
+IF(n_icoils>0)THEN
+  CALL c_f_pointer(icoil_dcurr, id_tmp, [n_icoils])
+ELSE
+  ALLOCATE(id_tmp(0)); id_dummy=.TRUE.
+END IF
+IF(n_vcoils>0)THEN
+  CALL c_f_pointer(vcoil_volt, vv_tmp, [n_vcoils])
+ELSE
+  ALLOCATE(vv_tmp(0)); vv_dummy=.TRUE.
+END IF
 CALL tw_td_step(state,vec_tmp,id_tmp,n_icoils,vv_tmp,n_vcoils,nits)
+IF(id_dummy) DEALLOCATE(id_tmp)
+IF(vv_dummy) DEALLOCATE(vv_tmp)
 END SUBROUTINE thincurr_td_step
 !---------------------------------------------------------------------------------
 !> C-binding: save plot output
